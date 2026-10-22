@@ -88,6 +88,24 @@ Gemma4MLP = Gemma3MLP
 Gemma4TextScaledWordEmbedding = Gemma3TextScaledWordEmbedding
 
 
+def maybe_remap_fp8_block_scale(name, loaded_weight, params_dict):
+    """Map ModelOpt FP8_PB_WO scales onto SGLang block-FP8 params.
+
+    ModelOpt stores per-block weight scales as ``weight_scale`` with shape
+    ``[out/128, 1, in/128, 1]``; ``Fp8LinearMethod`` registers them as
+    ``weight_scale_inv`` with shape ``[out/128, in/128]``. Left unmapped, the
+    scale keeps its ``finfo.min`` init and the layer outputs inf/NaN.
+    """
+    if not name.endswith(".weight_scale"):
+        return name, loaded_weight
+    candidate = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+    if candidate not in params_dict:
+        return name, loaded_weight
+    if loaded_weight.ndim == 4:
+        loaded_weight = loaded_weight[:, 0, :, 0]
+    return candidate, loaded_weight
+
+
 def load_tied_lm_head(
     loaded_weight, *, params_dict, loaded_params, head_param_name="lm_head.weight"
 ):
@@ -1213,6 +1231,11 @@ class Gemma4ForCausalLM(PreTrainedModel):
         self.capture_aux_hidden_states = True
         self.model.layers_to_capture = [val + 1 for val in layer_ids]
 
+    def get_dflash_noise_embedding_scale(self) -> float:
+        # embed_tokens bakes in Gemma's sqrt(hidden_size) normalizer; DFlash
+        # drafts (SpecForge) are trained on the raw embedding rows.
+        return 1.0 / float(self.model.embed_tokens.embed_scale)
+
     @torch.no_grad()
     def forward(
         self,
@@ -1403,6 +1426,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         if weight_name not in name:
                             continue
                         name = name.replace(weight_name, param_name)
+                        name, loaded_weight = maybe_remap_fp8_block_scale(
+                            name, loaded_weight, params_dict
+                        )
                         if name not in params_dict:
                             continue
                         param = params_dict[name]
@@ -1414,6 +1440,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
                         break
                     else:
                         name = orig_name
+                        name, loaded_weight = maybe_remap_fp8_block_scale(
+                            name, loaded_weight, params_dict
+                        )
                         if name.endswith(".bias") and name not in params_dict:
                             continue
                         name = maybe_remap_kv_scale_name(name, params_dict)
