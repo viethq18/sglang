@@ -86,5 +86,16 @@ def test_accuracy(M, N, K, out_dtype):
     _test_accuracy_once(M, N, K, out_dtype, "cuda")
 
 
+@pytest.mark.skipif(
+    not is_sm120_supported(), reason="fp8_blockwise_scaled_mm requires SM120 (>= 12.0)"
+)
+# Weights wider than 8192 switch tile families with M: non-swapAB 128x128 for
+# M in (64, 128] and (192, 256], swapAB 64-token tile for (128, 192].
+@pytest.mark.parametrize("M", [100, 128, 160, 192, 196, 256, 260])
+@pytest.mark.parametrize("N,K", [(16384, 1024), (1024, 16384)])
+def test_accuracy_wide_weight(M, N, K):
+    _test_accuracy_once(M, N, K, torch.bfloat16, "cuda")
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
