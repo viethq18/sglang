@@ -12,8 +12,10 @@ from sglang.kernels.ops.attention.metadata import (
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
 from sglang.kernels.ops.attention.paged_gqa_fp8_sm120 import (
+    MAX_PACKED_ROWS as PAGED_GQA_MAX_PACKED_ROWS,
     can_use_paged_gqa_fp8,
     paged_gqa_fp8_attention,
+    short_query_tail,
 )
 from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
@@ -117,6 +119,8 @@ class FlashAttentionMetadata:
     # Created lazily by the first rel_bias layer; lives as long as this metadata
     # object, which for CUDA-graph captures keeps the buffers owned by the graph.
     rel_bias_prep_cache: Optional[dict] = None
+    # Per-forward-pass cache of the packed-GQA short-query tail split, keyed by GQA group.
+    paged_gqa_short_tail: Optional[dict] = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -1503,6 +1507,7 @@ class FlashAttentionBackend(AttentionBackend):
         window_size: tuple[int, int],
         fa_kwargs: dict,
         out: Optional[torch.Tensor],
+        extend_seq_lens_cpu: Optional[list[int]] = None,
     ) -> Optional[torch.Tensor]:
         """Run the SM120 packed-GQA FP8 kernel, or return None when the call needs FA4."""
         if (
@@ -1524,6 +1529,21 @@ class FlashAttentionBackend(AttentionBackend):
             v_scale=layer.v_scale,
         ):
             return None
+        short_tail = None
+        group = layer.tp_q_head_num // layer.tp_k_head_num
+        if (
+            extend_seq_lens_cpu is not None
+            and max_seqlen_q * group > PAGED_GQA_MAX_PACKED_ROWS
+            and len(extend_seq_lens_cpu) == cache_seqlens.shape[0]
+        ):
+            metadata = self.forward_metadata
+            if metadata.paged_gqa_short_tail is None:
+                metadata.paged_gqa_short_tail = {}
+            if group not in metadata.paged_gqa_short_tail:
+                metadata.paged_gqa_short_tail[group] = short_query_tail(
+                    extend_seq_lens_cpu, group
+                )
+            short_tail = metadata.paged_gqa_short_tail[group]
         return paged_gqa_fp8_attention(
             q=q,
             key_cache=key_cache,
@@ -1537,6 +1557,7 @@ class FlashAttentionBackend(AttentionBackend):
             v_scale=layer.v_scale,
             window_left=window_size[0],
             out=out,
+            short_tail=short_tail,
         )
 
     def get_fused_kv_write_buffers(self, layer, forward_batch):
@@ -1902,6 +1923,7 @@ class FlashAttentionBackend(AttentionBackend):
                         window_size=window_size,
                         fa_kwargs=kwargs,
                         out=_fa_out,
+                        extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
                     )
             if result is None:
                 result = flash_attn_with_kvcache(

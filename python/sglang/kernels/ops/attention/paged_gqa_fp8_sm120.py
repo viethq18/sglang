@@ -32,6 +32,7 @@ Contract (all checked by `can_use_paged_gqa_fp8`):
   score mods.
 """
 
+from collections.abc import Sequence
 from typing import Optional
 
 import torch
@@ -356,6 +357,24 @@ def select_num_splits(batch: int, num_kv_heads: int, num_sms: int) -> int:
     return _SPLIT_CHOICES[-1]
 
 
+def short_query_tail(extend_seq_lens: Sequence[int], group: int) -> Optional[tuple[int, int, int]]:
+    """Split point of a long-query batch whose trailing requests are short queries.
+
+    Mixed chunked prefill appends the running decode rows (one token each) after the prefill
+    requests. Returns (first_req, first_token, max_q) of the longest run of trailing requests
+    with q_len x group <= MAX_PACKED_ROWS, or None when there is no such run or no request
+    precedes it.
+    """
+    first_req = len(extend_seq_lens)
+    max_q = 0
+    while first_req > 0 and extend_seq_lens[first_req - 1] * group <= MAX_PACKED_ROWS:
+        first_req -= 1
+        max_q = max(max_q, extend_seq_lens[first_req])
+    if first_req == 0 or first_req == len(extend_seq_lens) or max_q == 0:
+        return None
+    return first_req, sum(extend_seq_lens[:first_req]), max_q
+
+
 def paged_gqa_fp8_attention(
     *,
     q: torch.Tensor,
@@ -372,12 +391,17 @@ def paged_gqa_fp8_attention(
     out: Optional[torch.Tensor] = None,
     num_splits: Optional[int] = None,
     cascade: Optional[bool] = None,
+    short_tail: Optional[tuple[int, int, int]] = None,
 ) -> torch.Tensor:
     """Attention of `q` against the paged FP8 KV cache; returns BF16 [num_tokens, Hq, D].
 
     Short full-attention queries of batches of >= 16 requests run as a cascade: the longest page
     table prefix shared with request 0 (the common system prompt) is attended once per
     64 packed rows of the whole batch, and each request only streams its own suffix.
+
+    `short_tail` (from `short_query_tail`) splits a long-query batch: the trailing short
+    requests (mixed-chunk decode rows) take the short-query kernel instead of padding a
+    64-row prefill tile each and streaming the whole KV per request.
     """
     num_tokens, num_q_heads, head_dim = q.shape
     batch = cache_seqlens.shape[0]
@@ -388,6 +412,23 @@ def paged_gqa_fp8_attention(
     if out is None:
         out = torch.empty(num_tokens, num_q_heads, head_dim, dtype=torch.bfloat16,
                           device=q.device)
+    if max_seqlen_q * group > MAX_PACKED_ROWS and short_tail is not None:
+        first_req, first_token, tail_max_q = short_tail
+        common = dict(key_cache=key_cache, value_cache=value_cache, softmax_scale=softmax_scale,
+                      k_scale=k_scale, v_scale=v_scale, window_left=window_left)
+        paged_gqa_fp8_attention(
+            q=q[:first_token], page_table=page_table[:first_req],
+            cache_seqlens=cache_seqlens[:first_req], cu_seqlens_q=cu_seqlens_q[: first_req + 1],
+            max_seqlen_q=max_seqlen_q, out=out[:first_token], **common,
+        )
+        paged_gqa_fp8_attention(
+            q=q[first_token:], page_table=page_table[first_req:],
+            cache_seqlens=cache_seqlens[first_req:],
+            cu_seqlens_q=cu_seqlens_q[first_req:] - first_token,
+            max_seqlen_q=tail_max_q, out=out[first_token:], num_splits=num_splits,
+            cascade=cascade, **common,
+        )
+        return out
     if max_seqlen_q * group > MAX_PACKED_ROWS:
         grid = (triton.cdiv(max_seqlen_q * group, _PREFILL_BM), batch, num_kv_heads)
         _paged_gqa_prefill[grid](

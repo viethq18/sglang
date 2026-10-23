@@ -13,6 +13,7 @@ import torch
 from sglang.kernels.ops.attention.paged_gqa_fp8_sm120 import (
     can_use_paged_gqa_fp8,
     paged_gqa_fp8_attention,
+    short_query_tail,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -52,7 +53,7 @@ def _reference(q, k, v, page_table, seqlens, q_lens, softmax_scale, window):
 )
 class TestPagedGqaFp8Sm120(CustomTestCase):
     def _run(self, seqlens, q_lens, num_splits, num_kv_heads=4, head_dim=512, window=-1,
-             shared=None, cascade=None):
+             shared=None, cascade=None, short_tail=None):
         torch.manual_seed(0)
         dev = "cuda"
         num_slots = sum(seqlens) + 64
@@ -87,7 +88,7 @@ class TestPagedGqaFp8Sm120(CustomTestCase):
             max_seqlen_q=max(q_lens), softmax_scale=softmax_scale,
             k_scale=torch.tensor(K_SCALE, device=dev),
             v_scale=torch.tensor(V_SCALE, device=dev), window_left=window,
-            num_splits=num_splits, cascade=cascade,
+            num_splits=num_splits, cascade=cascade, short_tail=short_tail,
         )
         ref = _reference(q, k, v, page_table, seqlens_t, q_lens, softmax_scale, window)
         self.assertEqual(out.dtype, torch.bfloat16)
@@ -110,7 +111,23 @@ class TestPagedGqaFp8Sm120(CustomTestCase):
         # prefill kernel: a chunk after a cached prefix, a prefix-free prompt, and a
         # 9-token chunk whose last M tile is mostly padding.
         self._run(seqlens=[300, 37, 129], q_lens=[100, 37, 9], num_splits=None)
-        self._run(seqlens=[300, 37, 129], q_lens=[100, 37, 9], num_splits=None)
+
+    def test_mixed_chunk_short_tail(self):
+        # A mixed chunked-prefill batch: a 100-token chunk and a 37-token prompt, then 17
+        # one-token decode rows sharing a 600-key prompt (enough rows for the cascade).
+        q_lens = [100, 37] + [1] * 17
+        tail = short_query_tail(q_lens, group=8)
+        self.assertEqual(tail, (2, 137, 1))
+        self._run(seqlens=[300, 37] + [700 + 3 * i for i in range(17)], q_lens=q_lens,
+                  num_splits=None, shared=[0, 0] + [600] * 17, short_tail=tail)
+
+    def test_short_query_tail_split_point(self):
+        # 8 x 8 rows still fits the packed tile, 9 x 8 does not.
+        self.assertEqual(short_query_tail([300, 9, 8, 1, 4], group=8), (2, 309, 8))
+        # A long last request, an all-short batch, and an empty-only tail give no split.
+        self.assertIsNone(short_query_tail([1, 300], group=8))
+        self.assertIsNone(short_query_tail([4, 1, 2], group=8))
+        self.assertIsNone(short_query_tail([300, 0], group=8))
 
     def test_cascade_shared_prefix(self):
         # Requests 0, 1 and 3 share a 600-key prompt (not a multiple of the 64-key block),
