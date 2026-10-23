@@ -931,17 +931,6 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
         )
 
-    if cfg.enable_mixed_chunk:
-        declare_resolution(
-            server_args,
-            "_handle_frozen_kv_mtp",
-            enable_mixed_chunk=False,
-        )
-        logger.warning(
-            "Mixed chunked prefill is disabled because of using "
-            "Frozen-KV MTP speculative decoding."
-        )
-
 
 def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
