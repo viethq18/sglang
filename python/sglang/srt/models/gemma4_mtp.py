@@ -138,13 +138,22 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         self.post_init()
 
     def bind_frozen_kv_context(self, ctx: FrozenKVMTPContext) -> None:
-        """Bind assistant attention to target-owned KV and suppress assistant KV writes."""
+        """Bind assistant attention to target-owned KV and suppress assistant KV writes.
+
+        Also borrow the target layer's KV scales: the assistant has no KV quant
+        method, so it would read the target's FP8 KV with a descale of 1.0.
+        """
         for assistant_logical, layer in enumerate(self.model.layers):
             target_phys = ctx.get_physical_layer_id(assistant_logical)
             layer.self_attn.is_kv_shared_layer = True
             layer.self_attn.kv_shared_layer_index = target_phys
-            layer.self_attn.attn.layer_id = target_phys
             layer.self_attn.layer_id = assistant_logical
+            attn = layer.self_attn.attn
+            target_attn = ctx.target_attn_layers[target_phys]
+            attn.layer_id = target_phys
+            attn.k_scale, attn.v_scale = target_attn.k_scale, target_attn.v_scale
+            attn.k_scale_float = target_attn.k_scale_float
+            attn.v_scale_float = target_attn.v_scale_float
         self.kv_context = ctx
 
     def build_frozen_kv_mtp_context(
@@ -196,6 +205,9 @@ class Gemma4AssistantForCausalLM(Gemma4ForCausalLM):
         return FrozenKVMTPContext(
             target_token_to_kv_pool=target_token_to_kv_pool,
             physical_layer_ids=physical,
+            target_attn_layers={
+                phys: layers[phys].self_attn.attn for phys in set(physical.values())
+            },
         )
 
     def get_embed_and_head(self) -> Tuple[torch.Tensor, torch.Tensor]:

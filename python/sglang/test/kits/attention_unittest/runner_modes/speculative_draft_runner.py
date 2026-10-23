@@ -230,6 +230,7 @@ class _FrozenKVMTPWorkerHarness:
         self.kv_context = FrozenKVMTPContext(
             target_token_to_kv_pool=fixture.runner.token_to_kv_pool,
             physical_layer_ids={0: 0},
+            target_attn_layers={},
         )
         self.model_runner.forward = model_forward
         self._hidden_size = settings.hidden_size

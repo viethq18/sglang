@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import TYPE_CHECKING, Dict
 
 from sglang.srt.mem_cache.memory_pool import KVCache
 from sglang.srt.speculative.eagle_info import (
@@ -23,13 +23,21 @@ from sglang.srt.speculative.eagle_info import (
 )
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
+if TYPE_CHECKING:
+    from sglang.srt.layers.radix_attention import RadixAttention
+
 
 @dataclass(frozen=True)
 class FrozenKVMTPContext:
-    """Target KV pool + assistant-logical -> target-physical layer map."""
+    """Target KV pool + assistant-logical -> target-physical layer map.
+
+    ``target_attn_layers`` holds the target attention owning each physical
+    layer's KV; its KV scales must also descale the assistant's reads.
+    """
 
     target_token_to_kv_pool: KVCache
     physical_layer_ids: Dict[int, int]
+    target_attn_layers: Dict[int, RadixAttention]
 
     def get_physical_layer_id(self, idx: int) -> int:
         if idx not in self.physical_layer_ids:
