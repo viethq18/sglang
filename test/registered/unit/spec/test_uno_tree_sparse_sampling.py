@@ -24,6 +24,8 @@ class TestUnoTreeSparseSampling(CustomTestCase):
         )
         spec_config = SimpleNamespace(
             speculative_use_rejection_sampling=False,
+            speculative_accept_threshold_single=1.0,
+            speculative_accept_threshold_acc=1.0,
         )
         with (
             patch("sglang.srt.speculative.eagle_utils._is_cuda", True),
@@ -53,6 +55,11 @@ class TestUnoTreeSparseSampling(CustomTestCase):
             )
             sampling_info.need_min_p_sampling = False
             spec_config.speculative_use_rejection_sampling = True
+            self.assertFalse(
+                _can_use_sparse_uno_tree_target_sampling(128, sampling_info)
+            )
+            spec_config.speculative_use_rejection_sampling = False
+            spec_config.speculative_accept_threshold_acc = 0.5
             self.assertFalse(
                 _can_use_sparse_uno_tree_target_sampling(128, sampling_info)
             )

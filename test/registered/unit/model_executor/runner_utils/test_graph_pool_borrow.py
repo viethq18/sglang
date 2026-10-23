@@ -201,6 +201,7 @@ class TestGraphPoolBorrow(CustomTestCase):
             need_top_k_sampling=False,
             need_top_p_sampling=False,
             sampling_seed=None,
+            max_top_k=None,
         )
         batch = SimpleNamespace(
             device="cpu",

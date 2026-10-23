@@ -729,12 +729,30 @@ def _can_use_sparse_uno_tree_target_sampling(
 
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
+    spec = get_spec()
     return bool(
         _is_cuda
         and max_top_k <= _SPARSE_TOP_K_LIMIT
         and sampling_info.sampling_seed is None
         and not sampling_info.need_min_p_sampling
-        and not get_spec().speculative_use_rejection_sampling
+        and not spec.speculative_use_rejection_sampling
+        and spec.speculative_accept_threshold_single == 1.0
+        and spec.speculative_accept_threshold_acc == 1.0
+    )
+
+
+def prewarm_sparse_target_sampling(device: torch.device) -> None:
+    """Load flashinfer's top-k module before serving starts.
+
+    The first call JIT-builds the module, which can take minutes; doing that
+    on the first sampled verify step would trip the scheduler watchdog.
+    """
+    if not _is_cuda:
+        return
+    from sglang.srt.speculative.uno_utils import _flashinfer_top_k
+
+    _flashinfer_top_k(
+        torch.zeros((1, 256), dtype=torch.float32, device=device), 1, sorted=True
     )
 
 
@@ -858,6 +876,13 @@ def eagle_sample(
     # Sample tokens
     target_predict = None
     use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+    # Compact top-k support sampling is exact for target-only verify, so every
+    # EAGLE-family worker uses it whenever all requests bound top_k.
+    sparse_max_top_k = (
+        uno_target_max_top_k
+        if uno_target_max_top_k is not None
+        else sampling_info.max_top_k
+    )
     if _verify_uses_greedy(
         is_all_greedy=sampling_info.is_all_greedy,
         is_cpu=_is_cpu,
@@ -893,10 +918,7 @@ def eagle_sample(
                 tp_group.broadcast(predict, src=0)
                 tp_group.broadcast(accept_index, src=0)
                 tp_group.broadcast(num_correct_drafts, src=0)
-    elif _can_use_sparse_uno_tree_target_sampling(
-        uno_target_max_top_k,
-        sampling_info,
-    ):
+    elif _can_use_sparse_uno_tree_target_sampling(sparse_max_top_k, sampling_info):
         from sglang.srt.speculative.uno_utils import (
             sample_uno_tree_target_tokens,
         )
@@ -906,7 +928,7 @@ def eagle_sample(
             sampling_info=sampling_info,
             batch_size=bs,
             verify_width=verify_input.draft_token_num,
-            max_top_k=uno_target_max_top_k,
+            max_top_k=sparse_max_top_k,
         )
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,
