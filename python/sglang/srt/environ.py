@@ -1167,6 +1167,9 @@ class Envs:
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
     SGLANG_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
+    # SM120 FA4 backend: route FP8-KV Gemma-style GQA attention to the Triton kernels in
+    # paged_gqa_fp8_sm120 (HD512/HD256 decode and verify, HD512 full-attention prefill).
+    SGLANG_SM120_PAGED_GQA_FP8 = EnvBool(True)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

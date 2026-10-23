@@ -11,6 +11,10 @@ from sglang.kernels.ops.attention.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
+from sglang.kernels.ops.attention.paged_gqa_fp8_sm120 import (
+    can_use_paged_gqa_fp8,
+    paged_gqa_fp8_attention,
+)
 from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
     merge_suffix_attention_in_place,
@@ -20,6 +24,7 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -282,6 +287,13 @@ class FlashAttentionBackend(AttentionBackend):
         device_capability = get_device_capability()
         # SM120 FA4 runs FP8 KV natively for prefill and head dims above 256.
         self.fa4_sm120 = self.fa_impl_ver == 4 and device_capability[0] == 12
+        # FP8-KV GQA calls that the Triton kernels in paged_gqa_fp8_sm120 accept go
+        # there instead of FA4; the kernels index the KV cache per token, so page size 1.
+        self.use_paged_gqa_fp8 = (
+            self.fa4_sm120
+            and self.page_size == 1
+            and envs.SGLANG_SM120_PAGED_GQA_FP8.get()
+        )
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -1476,6 +1488,57 @@ class FlashAttentionBackend(AttentionBackend):
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
 
+    def run_paged_gqa_fp8(
+        self,
+        layer: RadixAttention,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q,
+        causal: bool,
+        window_size: tuple[int, int],
+        fa_kwargs: dict,
+        out: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """Run the SM120 packed-GQA FP8 kernel, or return None when the call needs FA4."""
+        if (
+            not self.use_paged_gqa_fp8
+            or not isinstance(max_seqlen_q, int)
+            or layer.is_cross_attention
+            or fa_kwargs.keys() - {"k_descale", "v_descale", "max_seqlen_k"}
+        ):
+            return None
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if not can_use_paged_gqa_fp8(
+            q=q,
+            key_cache=key_cache,
+            max_seqlen_q=max_seqlen_q,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            causal=causal,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
+        ):
+            return None
+        return paged_gqa_fp8_attention(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=layer.scaling,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
+            window_left=window_size[0],
+            out=out,
+        )
+
     def get_fused_kv_write_buffers(self, layer, forward_batch):
         if (
             self.kv_cache_dtype != torch.bfloat16
@@ -1824,6 +1887,23 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
+                result = None
+                if not (use_local_attn or use_cascade_attn or return_lse):
+                    result = self.run_paged_gqa_fp8(
+                        layer,
+                        q,
+                        key_cache,
+                        value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        causal=causal,
+                        window_size=window_size,
+                        fa_kwargs=kwargs,
+                        out=_fa_out,
+                    )
+            if result is None:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -2318,31 +2398,48 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=(
-                        self.decode_num_splits
-                        if not is_swa_layer
-                        and not use_cascade_attn
-                        and not pa_swa_active
-                        else self.num_splits
-                    ),
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    scheduler_metadata=sched_meta,
-                    **kwargs,
-                )
+                result = None
+                if not (use_cascade_attn or return_lse or pa_swa_active):
+                    result = self.run_paged_gqa_fp8(
+                        layer,
+                        q_reshaped,
+                        key_cache,
+                        value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        causal=causal,
+                        window_size=window_size,
+                        fa_kwargs=kwargs,
+                        out=_fa_out,
+                    )
+                if result is None:
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn or return_lse,
+                        num_splits=(
+                            self.decode_num_splits
+                            if not is_swa_layer
+                            and not use_cascade_attn
+                            and not pa_swa_active
+                            else self.num_splits
+                        ),
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        scheduler_metadata=sched_meta,
+                        **kwargs,
+                    )
                 if return_lse and not use_cascade_attn:
                     o, softmax_lse, *_ = result
                     decode_lse = softmax_lse.T.contiguous()
