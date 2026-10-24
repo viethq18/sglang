@@ -1702,6 +1702,19 @@ QWEN3_5_KV_SCALE_MAPPER = WeightsMapper(
 )
 
 
+def _remap_modelopt_fp8_block_scale(name: str, loaded_weight: torch.Tensor):
+    """Map a ModelOpt FP8_PB_WO block scale onto the block-FP8 param.
+
+    ModelOpt stores it as ``weight_scale`` [out/B, 1, in/B, 1]; ``Fp8LinearMethod``
+    registers ``weight_scale_inv`` [out/B, in/B]. Left unmapped, the layer keeps
+    its init scale and decodes garbage. NVFP4 ``weight_scale`` is 2-D and untouched.
+    """
+    if name.endswith(".weight_scale") and loaded_weight.ndim == 4:
+        name = name.removesuffix(".weight_scale") + ".weight_scale_inv"
+        loaded_weight = loaded_weight[:, 0, :, 0]
+    return name, loaded_weight
+
+
 class Qwen3_5ForCausalLM(nn.Module):
     """Qwen3.5 Model with support for dense variant."""
 
@@ -2011,6 +2024,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            name, loaded_weight = _remap_modelopt_fp8_block_scale(name, loaded_weight)
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -2477,6 +2491,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            name, loaded_weight = _remap_modelopt_fp8_block_scale(name, loaded_weight)
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
