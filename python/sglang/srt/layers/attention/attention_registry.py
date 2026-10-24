@@ -451,14 +451,12 @@ def attn_backend_wrapper(runner: "ModelRunner", full_attn_backend: "AttentionBac
         hybrid_backend_cls = HybridLinearAttnBackend
         if hybrid_gdn_config(runner.model_config) is not None:
             if is_blackwell():
-                if get_platform().is_sm120:
-                    allowed = {"triton", "trtllm_mha", "flashinfer"}
-                else:
-                    # FlashInfer paged prefill is also valid for SM100 hybrid
-                    # GDN models. In particular, quantized KV recipes use it
-                    # to expose an FP8 dequant workspace while a different
-                    # backend (for example TRT-LLM GenMHA) owns decode.
-                    allowed = HYBRID_GDN_SM100_BACKENDS
+                # SM120 FA4 (flash_attention_v4_sm120) runs FP8 KV and head_dim
+                # 256 natively, so the SM100 set applies there too. FlashInfer
+                # paged prefill is valid for hybrid GDN models; quantized KV
+                # recipes use it to expose an FP8 dequant workspace while a
+                # different backend (for example TRT-LLM GenMHA) owns decode.
+                allowed = HYBRID_GDN_SM100_BACKENDS
                 prefill_be = runner.prefill_attention_backend_str
                 decode_be = runner.decode_attention_backend_str
                 assert prefill_be in allowed and decode_be in allowed, (
