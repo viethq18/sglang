@@ -2118,6 +2118,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 mamba_steps_to_track=mamba_steps_to_track,
                 model=model_runner.model,
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
+                draft_token_num=int(self.block_size),
             )
 
     def _ensure_accept_bonus_buffers(self, bs: int) -> None:

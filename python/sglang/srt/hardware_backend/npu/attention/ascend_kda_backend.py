@@ -492,6 +492,7 @@ class AscendKDAHybridLinearAttnBackend:
                 mamba_steps_to_track,
                 model,
                 req_pool_indices=None,
+                draft_token_num=None,
             ):
                 from sgl_kernel_npu.mamba.mamba_state_update_triton import (
                     conv_state_rollback,
@@ -501,7 +502,7 @@ class AscendKDAHybridLinearAttnBackend:
                     speculative_state_scatter_npu,
                 )
 
-                del req_pool_indices
+                del req_pool_indices, draft_token_num
                 request_number = last_correct_step_indices.shape[0]
 
                 state_indices_tensor = (

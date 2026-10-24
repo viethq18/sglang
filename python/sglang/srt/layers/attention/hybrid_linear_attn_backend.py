@@ -1518,8 +1518,14 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model,
         req_pool_indices: Optional[torch.Tensor] = None,
+        draft_token_num: Optional[int] = None,
     ):
-        """Commit accepted Mamba states; PP rows identify the delayed batch."""
+        """Commit accepted Mamba states; PP rows identify the delayed batch.
+
+        ``draft_token_num`` is the verify window width; required only by the
+        GDN circular ReplaySSM commit (its cursor flush margin must match the
+        ``max_spec_len`` the verify kernel ran with).
+        """
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
@@ -1570,6 +1576,75 @@ class HybridLinearAttnBackend(AttentionBackend):
                 src_indices_raw=src_indices_raw,
                 null_block_id=-1,
             )
+            return
+
+        # ReplaySSM-GDN (circular ring): verify already appended this window's
+        # (d, k, g) records to the request-keyed ring; no intermediate_ssm is
+        # allocated. Advance the cursors by the accepted count, fold capacity
+        # rows / snapshot track rows from the ring, then roll the conv windows
+        # back. Mirrors the spec_utils commit used by EAGLE/NEXTN for the
+        # direct (dflash) callers. Chain layout only (topk <= 1).
+        if getattr(mamba_pool, "replayssm_cache_base", None) is not None:
+            if request_number == 0:
+                return
+            if draft_token_num is None or req_pool_indices is None:
+                raise ValueError(
+                    "GDN ReplaySSM spec commit requires draft_token_num and "
+                    "req_pool_indices from the caller."
+                )
+            from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
+                commit_gdn_replayssm_circular,
+                commit_gdn_replayssm_spec,
+            )
+
+            accept_lens = last_correct_step_indices + 1
+            replay_indices = req_pool_indices[:request_number]
+            commit_gdn_replayssm_spec(
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                num_accepted=accept_lens,
+                replay_indices=replay_indices,
+                max_cache_len=mamba_caches.replayssm_d.shape[-2],
+                max_spec_len=draft_token_num,
+                fold_every_commit=mamba_caches.temporal.dtype != torch.float32,
+                null_block_id=-1,
+            )
+            commit_gdn_replayssm_circular(
+                checkpoint_state=mamba_caches.temporal,
+                d_cache=mamba_caches.replayssm_d,
+                k_cache=mamba_caches.replayssm_k,
+                g_cache=mamba_caches.replayssm_g,
+                d_residual_cache=mamba_caches.replayssm_rawv,
+                k_residual_cache=mamba_caches.replayssm_rawk,
+                state_batch_indices=state_indices_tensor,
+                replay_indices=replay_indices,
+                write_pos=mamba_pool.replayssm_spec_write_pos,
+                cache_base=mamba_pool.replayssm_cache_base,
+                is_flush=mamba_pool.replayssm_is_flush,
+                accept_lens=accept_lens,
+                mamba_track_indices=mamba_track_indices,
+                mamba_steps_to_track=mamba_steps_to_track,
+                null_block_id=-1,
+            )
+            for conv_states, intermediate_conv_window in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                fused_conv_window_scatter_with_mask(
+                    conv_states,
+                    intermediate_conv_window,
+                    state_indices_tensor,
+                    last_correct_step_indices,
+                    src_indices_raw,
+                )
+                if mamba_track_indices is not None:
+                    fused_conv_window_scatter_with_mask(
+                        conv_states,
+                        intermediate_conv_window,
+                        mamba_track_indices,
+                        mamba_steps_to_track,
+                        src_indices_raw,
+                    )
             return
 
         # KDA fused-accept: the next verify seeds itself in-kernel from the
