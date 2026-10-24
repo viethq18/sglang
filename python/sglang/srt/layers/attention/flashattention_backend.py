@@ -11,6 +11,12 @@ from sglang.kernels.ops.attention.metadata import (
     prepare_swa_spec_page_table_triton,
 )
 from sglang.kernels.ops.attention.pa_page_table import _build_pa_page_table
+from sglang.kernels.ops.attention.paged_gqa_fp8_sm120 import (
+    MAX_PACKED_ROWS as PAGED_GQA_MAX_PACKED_ROWS,
+    can_use_paged_gqa_fp8,
+    paged_gqa_fp8_attention,
+    short_query_tail,
+)
 from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
     merge_suffix_attention_in_place,
@@ -20,6 +26,7 @@ from sglang.kernels.ops.attention.trtllm_mha_page_table import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.kv_shard_hooks import (
     get_kv_shard_pool,
@@ -112,6 +119,8 @@ class FlashAttentionMetadata:
     # Created lazily by the first rel_bias layer; lives as long as this metadata
     # object, which for CUDA-graph captures keeps the buffers owned by the graph.
     rel_bias_prep_cache: Optional[dict] = None
+    # Per-forward-pass cache of the packed-GQA short-query tail split, keyed by GQA group.
+    paged_gqa_short_tail: Optional[dict] = None
 
     # Encoder metadata
     # Cumulative sequence lengths for encoder key
@@ -209,9 +218,11 @@ class FlashAttentionBackend(AttentionBackend):
         # only; draft-side instances must not allocate it.
         self.is_draft_runner = model_runner.is_draft_worker
 
+        # SWA hybrid models split the KV cache into full and SWA pools with
+        # separate index spaces; SWA layers need a translated page_table.
+        self._swa_kv_pool: Optional[SWAKVPool] = self._resolve_swa_kv_pool(model_runner)
         self.use_sliding_window_kv_pool = (
-            isinstance(model_runner.token_to_kv_pool, SWAKVPool)
-            and model_runner.token_to_kv_pool.swa_layer_nums > 0
+            self._swa_kv_pool is not None and self._swa_kv_pool.swa_layer_nums > 0
         )
 
         self._kv_shard_pool = get_kv_shard_pool(self.token_to_kv_pool)
@@ -280,6 +291,13 @@ class FlashAttentionBackend(AttentionBackend):
         device_capability = get_device_capability()
         # SM120 FA4 runs FP8 KV natively for prefill and head dims above 256.
         self.fa4_sm120 = self.fa_impl_ver == 4 and device_capability[0] == 12
+        # FP8-KV GQA calls that the Triton kernels in paged_gqa_fp8_sm120 accept go
+        # there instead of FA4; the kernels index the KV cache per token, so page size 1.
+        self.use_paged_gqa_fp8 = (
+            self.fa4_sm120
+            and self.page_size == 1
+            and envs.SGLANG_SM120_PAGED_GQA_FP8.get()
+        )
         if self.fa_impl_ver == 3:
             from sgl_kernel.flash_attn import (
                 flash_attn_varlen_func,
@@ -382,6 +400,30 @@ class FlashAttentionBackend(AttentionBackend):
             _should_disable_scheduler_metadata_precompute()
         )
 
+    @staticmethod
+    def _resolve_swa_kv_pool(model_runner: ModelRunner) -> Optional[SWAKVPool]:
+        """Return the SWAKVPool to translate against, or None for non-SWA models.
+
+        EAGLE draft workers share the target allocator for token bookkeeping,
+        but own a separate draft KV pool. Do not use the target allocator's
+        SWA mapping for that draft pool. FROZEN_KV MTP is the exception: its
+        draft path reads target KV directly, so it still needs the allocator
+        pool when the active pool is not SWA.
+        """
+        active_pool = model_runner.token_to_kv_pool
+        if isinstance(active_pool, SWAKVPool):
+            return active_pool
+
+        # Only the frozen-KV draft falls back to the allocator pool.
+        if not (
+            model_runner.is_draft_worker
+            and model_runner.spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return None
+
+        kvcache = model_runner.token_to_kv_pool_allocator.get_kvcache()
+        return kvcache if isinstance(kvcache, SWAKVPool) else None
+
     def _maybe_init_local_attn_builder(
         self, model_runner: ModelRunner
     ) -> Optional[LocalAttentionMetadataBuilder]:
@@ -402,7 +444,7 @@ class FlashAttentionBackend(AttentionBackend):
             max_context_len=self.max_context_len,
             device=self.device,
             swa_translate=(
-                self.token_to_kv_pool.translate_loc_from_full_to_swa
+                self._swa_kv_pool.translate_loc_from_full_to_swa
                 if self.use_sliding_window_kv_pool
                 else None
             ),
@@ -550,7 +592,7 @@ class FlashAttentionBackend(AttentionBackend):
         # rebuild path.
         if not self.use_sliding_window_kv_pool:
             return None
-        return self.token_to_kv_pool.full_to_swa_index_mapping
+        return self._swa_kv_pool.full_to_swa_index_mapping
 
     def draft_extend_metadata_captured_in_graph(self) -> bool:
         # A translating backend rebuilds out of graph: the captured gather
@@ -559,7 +601,7 @@ class FlashAttentionBackend(AttentionBackend):
             return False
         return (
             not self.use_sliding_window_kv_pool
-            or self.token_to_kv_pool.full_to_swa_index_mapping is not None
+            or self._swa_kv_pool.full_to_swa_index_mapping is not None
         )
 
     def init_forward_metadata_out_graph(
@@ -614,8 +656,13 @@ class FlashAttentionBackend(AttentionBackend):
 
         # Refill the SWA write-target buffer (bound as a metadata view in
         # _bind_metadata_buffers) from the live out_cache_loc before replay.
-        if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            swa_out_cache_loc = self._get_swa_write_locations(forward_batch)
+        swa_out_cache_loc = (
+            self._get_swa_write_locations(forward_batch)
+            if self.use_sliding_window_kv_pool and out_cache_loc is not None
+            else None
+        )
+        # None: this runner has no SWA write space (a frozen-KV draft writes nothing).
+        if swa_out_cache_loc is not None:
             n = swa_out_cache_loc.shape[0]
             assert_buffer_fits(
                 n,
@@ -834,7 +881,7 @@ class FlashAttentionBackend(AttentionBackend):
             if self.use_sliding_window_kv_pool:
                 # SWA block table: translate the page-start full slots to their
                 # SWA cache locations, then reduce to SWA page indices.
-                swa_starts = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                swa_starts = self._swa_kv_pool.translate_loc_from_full_to_swa(
                     page_indices
                 )
                 m.swa_page_table[:, :max_seq_pages].copy_(swa_starts // self.page_size)
@@ -851,11 +898,14 @@ class FlashAttentionBackend(AttentionBackend):
                 # The runner-built capture batch writes the page-0 sink.
                 self.full_cg_prefill_swa_out_cache_loc[:num_out].zero_()
             else:
-                self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
-                    self.kv_index_translator.write_ids(
-                        forward_batch, IdSpaceKind.SLIDING_WINDOW
-                    )
+                swa_write_ids = self.kv_index_translator.write_ids(
+                    forward_batch, IdSpaceKind.SLIDING_WINDOW
                 )
+                # None: no SWA write space on this runner (a frozen-KV draft).
+                if swa_write_ids is not None:
+                    self.full_cg_prefill_swa_out_cache_loc[:num_out].copy_(
+                        swa_write_ids
+                    )
             # Captured kernels read the full bucket. Route its inactive tail to
             # SWA's zero dummy slot to prevent stale writes into live slots.
             self.full_cg_prefill_swa_out_cache_loc[num_out:].zero_()
@@ -1293,11 +1343,9 @@ class FlashAttentionBackend(AttentionBackend):
                 metadata.swa_out_cache_loc = swa_out_cache_loc
         elif self.use_sliding_window_kv_pool:
             # FA3 requires an int32 page_table.
-            metadata.swa_page_table = (
-                self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                    metadata.page_table
-                ).to(torch.int32)
-            )
+            metadata.swa_page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                metadata.page_table
+            ).to(torch.int32)
             metadata.swa_out_cache_loc = swa_out_cache_loc
 
         # Logical-page KV sharding: capture the batch's gather plan and swap the
@@ -1443,6 +1491,74 @@ class FlashAttentionBackend(AttentionBackend):
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
+
+    def run_paged_gqa_fp8(
+        self,
+        layer: RadixAttention,
+        q: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        *,
+        page_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        cu_seqlens_q: torch.Tensor,
+        max_seqlen_q,
+        causal: bool,
+        window_size: tuple[int, int],
+        fa_kwargs: dict,
+        out: Optional[torch.Tensor],
+        extend_seq_lens_cpu: Optional[list[int]] = None,
+    ) -> Optional[torch.Tensor]:
+        """Run the SM120 packed-GQA FP8 kernel, or return None when the call needs FA4."""
+        if (
+            not self.use_paged_gqa_fp8
+            or not isinstance(max_seqlen_q, int)
+            or layer.is_cross_attention
+            or fa_kwargs.keys() - {"k_descale", "v_descale", "max_seqlen_k"}
+        ):
+            return None
+        q = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
+        if not can_use_paged_gqa_fp8(
+            q=q,
+            key_cache=key_cache,
+            max_seqlen_q=max_seqlen_q,
+            window_size=window_size,
+            softcap=layer.logit_cap,
+            causal=causal,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
+        ):
+            return None
+        short_tail = None
+        group = layer.tp_q_head_num // layer.tp_k_head_num
+        if (
+            extend_seq_lens_cpu is not None
+            and max_seqlen_q * group > PAGED_GQA_MAX_PACKED_ROWS
+            and len(extend_seq_lens_cpu) == cache_seqlens.shape[0]
+        ):
+            metadata = self.forward_metadata
+            if metadata.paged_gqa_short_tail is None:
+                metadata.paged_gqa_short_tail = {}
+            if group not in metadata.paged_gqa_short_tail:
+                metadata.paged_gqa_short_tail[group] = short_query_tail(
+                    extend_seq_lens_cpu, group
+                )
+            short_tail = metadata.paged_gqa_short_tail[group]
+        return paged_gqa_fp8_attention(
+            q=q,
+            key_cache=key_cache,
+            value_cache=value_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max_seqlen_q,
+            softmax_scale=layer.scaling,
+            k_scale=layer.k_scale,
+            v_scale=layer.v_scale,
+            window_left=window_size[0],
+            out=out,
+            short_tail=short_tail,
+        )
 
     def get_fused_kv_write_buffers(self, layer, forward_batch):
         if (
@@ -1682,7 +1798,7 @@ class FlashAttentionBackend(AttentionBackend):
                 if metadata.swa_page_table is not None:
                     page_table = metadata.swa_page_table
                 else:
-                    page_table = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+                    page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
                         metadata.page_table
                     ).to(torch.int32)
             cu_seqlens_q = metadata.cu_seqlens_q
@@ -1792,6 +1908,24 @@ class FlashAttentionBackend(AttentionBackend):
                     **kwargs,
                 )
             else:
+                result = None
+                if not (use_local_attn or use_cascade_attn or return_lse):
+                    result = self.run_paged_gqa_fp8(
+                        layer,
+                        q,
+                        key_cache,
+                        value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        causal=causal,
+                        window_size=window_size,
+                        fa_kwargs=kwargs,
+                        out=_fa_out,
+                        extend_seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                    )
+            if result is None:
                 result = flash_attn_with_kvcache(
                     q=q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                     k_cache=key_cache,
@@ -2256,11 +2390,9 @@ class FlashAttentionBackend(AttentionBackend):
                     if metadata.swa_page_table is not None:
                         page_table = metadata.swa_page_table
                     else:
-                        page_table = (
-                            self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                                metadata.page_table
-                            ).to(torch.int32)
-                        )
+                        page_table = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                            metadata.page_table
+                        ).to(torch.int32)
                 cache_seqlens = metadata.cache_seqlens_int32
                 max_seqlen_q = metadata.max_seq_len_q
 
@@ -2288,31 +2420,48 @@ class FlashAttentionBackend(AttentionBackend):
                     sched_meta = metadata.scheduler_metadata
                 if self._decode_uses_static_max_seqlen_k:
                     kwargs["max_seqlen_k"] = metadata.max_seq_len_k
-                result = flash_attn_with_kvcache(
-                    q=q_reshaped,
-                    k_cache=key_cache,
-                    v_cache=value_cache,
-                    page_table=page_table,
-                    cache_seqlens=cache_seqlens,
-                    cu_seqlens_q=metadata.cu_seqlens_q,
-                    max_seqlen_q=max_seqlen_q,
-                    softmax_scale=layer.scaling,
-                    causal=False if use_cascade_attn else causal,
-                    window_size=window_size,
-                    softcap=layer.logit_cap,
-                    return_softmax_lse=use_cascade_attn or return_lse,
-                    num_splits=(
-                        self.decode_num_splits
-                        if not is_swa_layer
-                        and not use_cascade_attn
-                        and not pa_swa_active
-                        else self.num_splits
-                    ),
-                    out=_fa_out,
-                    ver=self.fa_impl_ver,
-                    scheduler_metadata=sched_meta,
-                    **kwargs,
-                )
+                result = None
+                if not (use_cascade_attn or return_lse or pa_swa_active):
+                    result = self.run_paged_gqa_fp8(
+                        layer,
+                        q_reshaped,
+                        key_cache,
+                        value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        causal=causal,
+                        window_size=window_size,
+                        fa_kwargs=kwargs,
+                        out=_fa_out,
+                    )
+                if result is None:
+                    result = flash_attn_with_kvcache(
+                        q=q_reshaped,
+                        k_cache=key_cache,
+                        v_cache=value_cache,
+                        page_table=page_table,
+                        cache_seqlens=cache_seqlens,
+                        cu_seqlens_q=metadata.cu_seqlens_q,
+                        max_seqlen_q=max_seqlen_q,
+                        softmax_scale=layer.scaling,
+                        causal=False if use_cascade_attn else causal,
+                        window_size=window_size,
+                        softcap=layer.logit_cap,
+                        return_softmax_lse=use_cascade_attn or return_lse,
+                        num_splits=(
+                            self.decode_num_splits
+                            if not is_swa_layer
+                            and not use_cascade_attn
+                            and not pa_swa_active
+                            else self.num_splits
+                        ),
+                        out=_fa_out,
+                        ver=self.fa_impl_ver,
+                        scheduler_metadata=sched_meta,
+                        **kwargs,
+                    )
                 if return_lse and not use_cascade_attn:
                     o, softmax_lse, *_ = result
                     decode_lse = softmax_lse.T.contiguous()
@@ -2981,11 +3130,11 @@ class FlashAttentionBackend(AttentionBackend):
             seq_len_delta,
             self.page_size,
             metadata.swa_page_table,
-            full_to_swa_index_mapping=(
-                self.token_to_kv_pool.full_to_swa_index_mapping
-                if self.use_sliding_window_kv_pool
-                else None
-            ),
+ full_to_swa_index_mapping=(
+ self._swa_kv_pool.full_to_swa_index_mapping
+ if self.use_sliding_window_kv_pool
+ else None
+ ),
             skip_page_table=translated,
         )
         if translated:
@@ -3350,10 +3499,8 @@ class FlashAttentionBackend(AttentionBackend):
                     self.use_sliding_window_kv_pool
                     and metadata.swa_page_table is not None
                 ):
-                    swa_page_indices = (
-                        self.token_to_kv_pool.translate_loc_from_full_to_swa(
-                            page_indices
-                        )
+                    swa_page_indices = self._swa_kv_pool.translate_loc_from_full_to_swa(
+                        page_indices
                     )
                     metadata.swa_page_table[:, :max_seq_pages].copy_(
                         swa_page_indices // self.page_size
@@ -3450,10 +3597,10 @@ class FlashAttentionBackend(AttentionBackend):
         page_table_a = metadata.page_table
         page_table_b = metadata_expand.page_table
         if self.use_sliding_window_kv_pool:
-            page_table_a = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            page_table_a = self._swa_kv_pool.translate_loc_from_full_to_swa(
                 page_table_a
             ).to(torch.int32)
-            page_table_b = self.token_to_kv_pool.translate_loc_from_full_to_swa(
+            page_table_b = self._swa_kv_pool.translate_loc_from_full_to_swa(
                 page_table_b
             ).to(torch.int32)
 

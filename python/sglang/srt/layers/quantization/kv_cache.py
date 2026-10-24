@@ -81,3 +81,27 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+
+def drop_kv_scales_for_unquantized_cache(
+    model: torch.nn.Module, kv_cache_dtype: torch.dtype
+) -> None:
+    """Ignore checkpoint KV scales when the KV cache is not quantized.
+
+    A 16/32-bit cache stores K/V unscaled, but backends still descale reads
+    by any loaded ``k_scale``/``v_scale``.
+    """
+    if kv_cache_dtype.itemsize < 2:
+        return
+    num_layers = 0
+    for module in model.modules():
+        if isinstance(getattr(module, "quant_method", None), BaseKVCacheMethod):
+            module.k_scale = module.v_scale = None
+            module.k_scale_float = module.v_scale_float = None
+            num_layers += 1
+    if num_layers:
+        logger.info(
+            "Ignoring checkpoint KV scales on %d layers: KV cache dtype %s.",
+            num_layers,
+            kv_cache_dtype,
+        )

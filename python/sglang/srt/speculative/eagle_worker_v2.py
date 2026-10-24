@@ -95,6 +95,7 @@ from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec,
     organize_draft_results,
     per_step_draft_out_cache_loc,
+    prewarm_sparse_target_sampling,
 )
 from sglang.srt.speculative.eagle_worker_common import (
     build_eagle_verify_input,
@@ -1363,6 +1364,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
                         else get_exec().graph.cuda_graph_bs_decode
                     ),
                 )
+
+    def prewarm_sampling(self):
+        prewarm_sparse_target_sampling(self._target_worker.model_runner.device)
+        return super().prewarm_sampling()
 
     def forward_batch_generation(
         self,

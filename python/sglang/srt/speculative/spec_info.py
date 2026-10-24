@@ -153,6 +153,7 @@ class SpeculativeAlgorithm(Enum):
         return self in (
             SpeculativeAlgorithm.EAGLE,
             SpeculativeAlgorithm.EAGLE3,
+            SpeculativeAlgorithm.FROZEN_KV_MTP,
             SpeculativeAlgorithm.DFLASH,
             SpeculativeAlgorithm.DSPARK,
         )

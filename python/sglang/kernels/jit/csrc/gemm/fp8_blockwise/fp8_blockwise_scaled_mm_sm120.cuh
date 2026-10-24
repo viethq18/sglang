@@ -443,16 +443,25 @@ void sm120_fp8_blockwise_dispatch_shape(
     tvm::ffi::TensorView scales_b,
     cudaStream_t stream) {
   const int m = a.size(0);
+  const int n = out.size(1);
+  const int k = a.size(1);
   using EpilogueTileShape = Shape<_128, _64>;
 
   // swapAB keeps the weight on the gemm-M axis and the tokens on gemm-N, so it reads the
   // weight once per token tile and needs only (128+TileN)*128 bytes of smem per stage.
-  // It stays ahead of the non-swapAB path well past the old m<=64 crossover: autotuned
-  // over 12 tactics x M in {4..1024} x all five Qwen3.x-27B-FP8 TP1 decode shapes
-  // (cold-L2 CUPTI + CUDA graph, one GPU per shape), the old crossover cost 4.5-7.3% of a
-  // full pass for m in [96, 256] -- e.g. out_proj at m=96: 51.74us non-swapAB (StreamK,
-  // 188 CTAs) vs 38.23us swapAB (120 CTAs).
-  if (m <= 128 || (m % 4 != 0)) {
+  // For small weights (n, k <= 8192) it stays ahead of the non-swapAB path well past the old
+  // m<=64 crossover: autotuned over 12 tactics x M in {4..1024} x all five Qwen3.x-27B-FP8
+  // TP1 decode shapes (cold-L2 CUPTI + CUDA graph, one GPU per shape), the old crossover
+  // cost 4.5-7.3% of a full pass for m in [96, 256] -- e.g. out_proj at m=96: 51.74us
+  // non-swapAB (StreamK, 188 CTAs) vs 38.23us swapAB (120 CTAs).
+  //
+  // Wide weights fill whole 128-token tiles at m in (64, 128] and (192, 256] and go
+  // non-swapAB there. Gemma-4-31B MTP verify (m = 4 * bs), cold-L2 on RTX PRO 6000:
+  // m=100 qkv 16384x5376 92.3 -> 71.2us, gate_up 43008x5376 287.0 -> 201.4us,
+  // down 5376x21504 144.1 -> 110.6us; m=252 qkv_full 20480x5376 209.4 -> 176.8us,
+  // gate_up 438.6 -> 383.6us, down 212.7 -> 198.2us.
+  const bool small_weight = n <= 8192 && k <= 8192;
+  if (m <= 64 || (m % 4 != 0) || (m <= 128 && small_weight)) {
     launch_sm120_fp8_blockwise_scaled_mm_swapab<
         OutType,
         Shape<_128, _32, _128>,
@@ -462,10 +471,11 @@ void sm120_fp8_blockwise_dispatch_shape(
     return;
   }
 
-  // 128 < m <= 256: a 64-wide token tile amortizes the weight read over twice as many
-  // tokens per pass. 3 stages instead of 4 ((128+64)*128 = 24576 B per stage), which the
-  // sweep shows costs nothing.
-  if (m <= 256) {
+  // A 64-wide token tile amortizes the weight read over twice as many tokens per pass.
+  // 3 stages instead of 4 ((128+64)*128 = 24576 B per stage), which the sweep shows costs
+  // nothing. Wide weights take it only for 128 < m <= 192, where 128-token tiles would be
+  // 25-50% padding.
+  if ((m > 128 && m <= 192) || (m <= 256 && small_weight)) {
     launch_sm120_fp8_blockwise_scaled_mm_swapab<
         OutType,
         Shape<_128, _64, _128>,

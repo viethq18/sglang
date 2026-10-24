@@ -88,6 +88,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.layers.quantization.kv_cache import drop_kv_scales_for_unquantized_cache
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -1571,6 +1572,9 @@ class ModelRunner:
             if resolved_kv_cache_dtype is not None
             else get_model().kv_cache_dtype
         )
+        model = getattr(self, "model", None)
+        if model is not None:
+            drop_kv_scales_for_unquantized_cache(model, self.kv_cache_dtype)
 
     def _get_attention_backend(self, init_new_workspace: bool = False):
         return get_attention_backend(
