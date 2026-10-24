@@ -1188,21 +1188,27 @@ class MambaPool:
                     f"overlap={sorted(overlap)}"
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
+            self._copy_temporal_slots(src_indices, dst_indices)
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                     :, src_indices
                 ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+            self._copy_temporal_slots(src_indices, dst_indices)
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         for sibling in self._slot_siblings:
             sibling.copy_slots(src_indices, dst_indices)
+
+    def _copy_temporal_slots(
+        self, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        # Copy one layer at a time: an all-layer gather materializes
+        # [layers, n, *state] at once (GBs for fp32 GDN states), which OOMs
+        # once the KV pool has claimed the remaining device memory.
+        temporal = self.mamba_cache.temporal
+        for layer_id in range(temporal.shape[0]):
+            temporal[layer_id, dst_indices] = temporal[layer_id, src_indices]
 
     def get_cpu_copy(self, indices):
         current_platform.synchronize()
