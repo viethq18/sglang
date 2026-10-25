@@ -667,10 +667,11 @@ class InklingShortConvHybridAttnBackend(ShortConvHybridAttnBackend):
         mamba_steps_to_track: Optional[torch.Tensor],
         model=None,
         req_pool_indices: Optional[torch.Tensor] = None,
+        draft_token_num: Optional[int] = None,
     ):
         """Overrides the generic mamba scatter, which sources slot ids from
         ``forward_metadata`` -- stale once the forward context has exited."""
-        del model
+        del model, draft_token_num
         assert req_pool_indices is not None, (
             "Inkling's conv-state commit needs req_pool_indices; the caller must "
             "pass the verify batch's request slots."
