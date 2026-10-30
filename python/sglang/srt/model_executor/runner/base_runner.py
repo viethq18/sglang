@@ -277,6 +277,10 @@ class BaseRunner(ABC):
         if prepare_model_resources is not None:
             prepare_model_resources(mr)
 
+        warmup_attn_kernels = getattr(mr.attn_backend, "warmup_kernels", None)
+        if warmup_attn_kernels is not None:
+            warmup_attn_kernels(mr.model, mr.max_running_requests)
+
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()
             assert buffers is not None, (

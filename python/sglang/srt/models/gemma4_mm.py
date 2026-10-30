@@ -304,6 +304,9 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         """Pad input IDs with image and audio tokens."""
         return pad_mm_tokens(input_ids, mm_inputs)
 
+    def precompile_kernels_after_loading(self) -> None:
+        self.language_model.precompile_kernels_after_loading()
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.language_model.get_input_embeddings()
 

@@ -456,14 +456,7 @@ class Gemma4Attention(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
 
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-        **kwargs,
-    ):
-        qkv, _ = self.qkv_proj(hidden_states)
+    def _norm_qkv(self, qkv: torch.Tensor):
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
 
         # Fused Q/K/V RMSNorm: replaces three separate norm kernels with one.
@@ -525,6 +518,31 @@ class Gemma4Attention(nn.Module):
                 k = self.k_norm(k)
                 v = v.unflatten(-1, (self.num_kv_heads, self.head_dim))
                 v = self.v_norm(v)
+        return q, k, v
+
+    def precompile_qkv_norm(self) -> None:
+        """Compile the fused QKV-norm variants: one program per head up to 256 tokens,
+        one per token above, so a long extend does not compile mid-serving."""
+        weight = self.q_norm.weight
+        for num_tokens in (1, 257):
+            self._norm_qkv(
+                torch.zeros(
+                    num_tokens,
+                    self.q_size + 2 * self.kv_size,
+                    dtype=weight.dtype,
+                    device=weight.device,
+                )
+            )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        **kwargs,
+    ):
+        qkv, _ = self.qkv_proj(hidden_states)
+        q, k, v = self._norm_qkv(qkv)
 
         # Apply rotary embedding
         use_fused_kv = False
@@ -965,6 +983,11 @@ class Gemma4TextModel(PreTrainedModel):
         self.layers_to_capture = []
         self.post_init()
 
+    def precompile_kernels_after_loading(self) -> None:
+        for module in self.modules():
+            if isinstance(module, Gemma4Attention):
+                module.precompile_qkv_norm()
+
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -1210,6 +1233,9 @@ class Gemma4ForCausalLM(PreTrainedModel):
         if self.pp_group.world_size > 1:
             return
         super().tie_weights(*args, **kwargs)
+
+    def precompile_kernels_after_loading(self) -> None:
+        self.model.precompile_kernels_after_loading()
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

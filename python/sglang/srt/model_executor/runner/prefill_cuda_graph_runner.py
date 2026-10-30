@@ -875,12 +875,17 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 kwargs = _build_layer_model_forward_kwargs(
                     self.layer_model, forward_batch, pp_proxy_tensors
                 )
+                embeds_name = next(
+                    (n for n in ("input_embeds", "inputs_embeds") if n in kwargs),
+                    None,
+                )
                 if pp_proxy_tensors is not None:
                     input_ids = None
-                    for embeds_name in ("input_embeds", "inputs_embeds"):
-                        if embeds_name in kwargs:
-                            kwargs[embeds_name] = None
-                            break
+                    if embeds_name is not None:
+                        kwargs[embeds_name] = None
+                elif self.is_multimodal and embeds_name and kwargs[embeds_name] is not None:
+                    # general_mm_embed_routine calls the body with input_ids=None.
+                    input_ids = None
                 output = self.layer_model.forward(
                     input_ids,
                     positions,

@@ -49,14 +49,17 @@ _PREFIX_SPLITS = 4
 _CASCADE_MIN_BATCH = 16
 
 
-@triton.jit
+# Runtime ints and slice-dependent pointers stay unspecialized: specializing them on
+# divisibility/alignment multiplies the variants, each a 1-3 s compile mid-serving.
+@triton.jit(do_not_specialize=["s_pt", "s_lt", "s_lh", "SPLITS"],
+            do_not_specialize_on_alignment=["PT", "SL", "CUQ"])
 def _paged_gqa_fwd(
     Q, K, V, PT, SL, CUQ, KS, VS, O, OP, LSEP, NLO,
     qk_scale_log2,
     s_qt, s_qh, s_kt, s_kh, s_vt, s_vh, s_pt, s_ot, s_oh,
-    s_opt, s_oph, s_ops, s_lt, s_lh,
+    s_opt, s_oph, s_ops, s_lt, s_lh, SPLITS,
     G: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-    SPLITS: tl.constexpr, WINDOW: tl.constexpr, CASCADE: tl.constexpr,
+    PARTIAL: tl.constexpr, WINDOW: tl.constexpr, CASCADE: tl.constexpr,
 ):
     b = tl.program_id(0)
     h = tl.program_id(1)
@@ -113,7 +116,7 @@ def _paged_gqa_fwd(
 
     pv_scale = tl.load(VS).to(tl.float32) * (1.0 / 256.0)
     out = acc * (pv_scale / tl.where(l_i == 0.0, 1.0, l_i))[:, None]
-    if SPLITS == 1 and not CASCADE:
+    if not PARTIAL:
         tl.store(O + tok[:, None] * s_ot + head[:, None] * s_oh + d[None, :],
                  out.to(O.dtype.element_ty), mask=row_ok[:, None])
     else:
@@ -123,7 +126,7 @@ def _paged_gqa_fwd(
         tl.store(LSEP + tok * s_lt + head * s_lh + sp, lse, mask=row_ok)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["s_pt"], do_not_specialize_on_alignment=["PT", "SL", "CUQ"])
 def _shared_prefix_len(PT, SL, CUQ, LCP, s_pt, BLK: tl.constexpr):
     """LCP[b] = leading page-table slots request b shares with request 0, capped at the
     first query position of b so every query row of b sees the whole prefix."""
@@ -141,7 +144,7 @@ def _shared_prefix_len(PT, SL, CUQ, LCP, s_pt, BLK: tl.constexpr):
     tl.store(LCP + b, lcp)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["batch"])
 def _select_shared_prefix(LCP, NLO, batch, BP2: tl.constexpr):
     """Pick the prefix length P maximising P x #requests sharing it (graph padding rows and
     requests outside the shared prompt do not drag P to zero). NLO[b] = P for requests that
@@ -156,14 +159,15 @@ def _select_shared_prefix(LCP, NLO, batch, BP2: tl.constexpr):
     tl.store(NLO + batch, p)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows", "batch", "s_lt", "s_lh", "SLOT0"],
+            do_not_specialize_on_alignment=["PT"])
 def _paged_gqa_prefix(
     Q, K, V, PT, NLO, KS, VS, OP, LSEP,
     qk_scale_log2, num_rows, batch,
     s_qt, s_qh, s_kt, s_kh, s_vt, s_vh,
-    s_opt, s_oph, s_ops, s_lt, s_lh,
+    s_opt, s_oph, s_ops, s_lt, s_lh, SLOT0,
     G: tl.constexpr, D: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr,
-    PSPLITS: tl.constexpr, SLOT0: tl.constexpr,
+    PSPLITS: tl.constexpr,
 ):
     """Shared-prefix part of a cascade: one program owns 64 packed (token, q head) rows of the
     whole batch for one KV head and one split of keys [0, P), read via request 0's pages.
@@ -214,7 +218,7 @@ def _paged_gqa_prefix(
 
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["s_pt"], do_not_specialize_on_alignment=["PT", "SL", "CUQ"])
 def _paged_gqa_prefill(
     Q, K, V, PT, SL, CUQ, KS, VS, O,
     qk_scale_log2,
@@ -284,12 +288,12 @@ def _paged_gqa_prefill(
              out.to(O.dtype.element_ty), mask=row_ok[:, None])
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["s_lt", "s_lh", "MAX_T", "SPLITS", "SUFFIX_SPLITS"],
+            do_not_specialize_on_alignment=["CUQ", "NLO"])
 def _paged_gqa_combine(
     OP, LSEP, CUQ, NLO, O,
-    s_opt, s_oph, s_ops, s_lt, s_lh, s_ot, s_oh,
-    MAX_T: tl.constexpr, SPLITS: tl.constexpr, SP2: tl.constexpr, D: tl.constexpr,
-    SUFFIX_SPLITS: tl.constexpr,
+    s_opt, s_oph, s_ops, s_lt, s_lh, s_ot, s_oh, MAX_T, SPLITS, SUFFIX_SPLITS,
+    SP2: tl.constexpr, D: tl.constexpr, CASCADE: tl.constexpr,
 ):
     """Merge SPLITS partial (output, base-2 LSE) slots per query row. With a cascade, slots
     from SUFFIX_SPLITS on hold the shared prefix and only count for requests sharing it."""
@@ -301,7 +305,7 @@ def _paged_gqa_combine(
         tok = (q_start + t).to(tl.int64)
         s = tl.arange(0, SP2)
         s_ok = s < SPLITS
-        if SUFFIX_SPLITS < SPLITS:
+        if CASCADE:
             s_ok = s_ok & ((s < SUFFIX_SPLITS) | (tl.load(NLO + b) > 0))
         lse = tl.load(LSEP + tok * s_lt + hq * s_lh + s, mask=s_ok, other=-float("inf"))
         m = tl.max(lse, 0)
@@ -477,8 +481,8 @@ def paged_gqa_fp8_attention(
             softmax_scale * _LOG2E, num_tokens * group, batch,
             q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
             partial.stride(0), partial.stride(1), partial.stride(2), lse.stride(0), lse.stride(1),
-            G=group, D=head_dim, BM=_PREFILL_BM, BN=_PREFILL_BN,
-            PSPLITS=prefix_splits, SLOT0=num_splits, num_warps=8, num_stages=1,
+            num_splits, G=group, D=head_dim, BM=_PREFILL_BM, BN=_PREFILL_BN,
+            PSPLITS=prefix_splits, num_warps=8, num_stages=1,
         )
     _paged_gqa_fwd[(batch, num_kv_heads, num_splits)](
         q, k, v, page_table, cache_seqlens, cu_seqlens_q, k_scale, v_scale, out, partial, lse,
@@ -486,15 +490,51 @@ def paged_gqa_fp8_attention(
         q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1),
         page_table.stride(0), out.stride(0), out.stride(1),
         partial.stride(0), partial.stride(1), partial.stride(2), lse.stride(0), lse.stride(1),
-        G=group, D=head_dim, BM=packed_rows, BN=32, SPLITS=num_splits, WINDOW=window_left,
-        CASCADE=cascade, num_warps=4, num_stages=2 if packed_rows >= 32 else 3,
+        num_splits, G=group, D=head_dim, BM=packed_rows, BN=32, PARTIAL=total_splits > 1,
+        WINDOW=window_left, CASCADE=cascade, num_warps=4,
+        num_stages=2 if packed_rows >= 32 else 3,
     )
     if total_splits > 1:
         _paged_gqa_combine[(batch * max_seqlen_q, num_q_heads)](
             partial, lse, cu_seqlens_q, nlo, out,
             partial.stride(0), partial.stride(1), partial.stride(2),
             lse.stride(0), lse.stride(1), out.stride(0), out.stride(1),
-            MAX_T=max_seqlen_q, SPLITS=total_splits, SP2=triton.next_power_of_2(total_splits),
-            D=head_dim, SUFFIX_SPLITS=num_splits, num_warps=4,
+            max_seqlen_q, total_splits, num_splits, SP2=triton.next_power_of_2(total_splits),
+            D=head_dim, CASCADE=cascade, num_warps=4,
         )
     return out
+
+
+def warmup_paged_gqa_fp8(
+    *,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    window_left: int,
+    max_batch: int,
+    device: torch.device,
+) -> None:
+    """Compile every kernel variant `paged_gqa_fp8_attention` launches for one layer shape:
+    each packed-row tile and split/cascade choice for 1..max_batch requests, and the prefill
+    kernel when the shape has one."""
+    group = num_q_heads // num_kv_heads
+    kv = torch.zeros(16, 1, num_kv_heads, head_dim, dtype=torch.float8_e4m3fn, device=device)
+    scale = torch.ones(1, dtype=torch.float32, device=device)
+    common = dict(key_cache=kv, value_cache=kv, softmax_scale=1.0, k_scale=scale,
+                  v_scale=scale, window_left=window_left)
+    q_lens = sorted({max(1, rows // group) for rows in (16, 32, MAX_PACKED_ROWS)})
+    if head_dim == 512 and window_left < 0:
+        q_lens.append(MAX_PACKED_ROWS // group + 1)
+    for batch in range(1, max_batch + 1):
+        for q_len in q_lens:
+            if q_len * group > MAX_PACKED_ROWS and batch > 1:
+                continue
+            paged_gqa_fp8_attention(
+                q=torch.zeros(batch * q_len, num_q_heads, head_dim, dtype=torch.float8_e4m3fn,
+                              device=device),
+                page_table=torch.zeros(batch, q_len, dtype=torch.int32, device=device),
+                cache_seqlens=torch.full((batch,), q_len, dtype=torch.int32, device=device),
+                cu_seqlens_q=torch.arange(0, (batch + 1) * q_len, q_len, dtype=torch.int32,
+                                          device=device),
+                max_seqlen_q=q_len, **common,
+            )

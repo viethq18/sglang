@@ -16,6 +16,7 @@ from sglang.kernels.ops.attention.paged_gqa_fp8_sm120 import (
     can_use_paged_gqa_fp8,
     paged_gqa_fp8_attention,
     short_query_tail,
+    warmup_paged_gqa_fp8,
 )
 from sglang.kernels.ops.attention.suffix_attention_merge import (
     can_use_fused_suffix_attention_merge,
@@ -1492,6 +1493,34 @@ class FlashAttentionBackend(AttentionBackend):
             q_rope = q_rope.to(self.kv_cache_dtype) if q_rope is not None else None
             k_rope = k_rope.to(self.kv_cache_dtype) if k_rope is not None else None
         return q, q_rope, k_rope, k_descale, v_descale
+
+    def warmup_kernels(self, model: torch.nn.Module, max_batch: int) -> None:
+        """Compile the paged GQA FP8 kernel variants of every attention layer shape."""
+        if not self.use_paged_gqa_fp8 or self.kv_cache_dtype != torch.float8_e4m3fn:
+            return
+        from sglang.srt.layers.radix_attention import RadixAttention
+
+        shapes = set()
+        for layer in model.modules():
+            if not isinstance(layer, RadixAttention) or layer.is_cross_attention:
+                continue
+            window = layer.sliding_window_size
+            windows = {window if window is not None and window > -1 else -1}
+            if self.is_prefill_aware_swa:
+                windows.add(-1)
+            for window_left in windows:
+                shapes.add(
+                    (layer.tp_q_head_num, layer.tp_k_head_num, layer.head_dim, window_left)
+                )
+        for num_q_heads, num_kv_heads, head_dim, window_left in sorted(shapes):
+            warmup_paged_gqa_fp8(
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                window_left=window_left,
+                max_batch=max_batch,
+                device=torch.device(self.device),
+            )
 
     def run_paged_gqa_fp8(
         self,
