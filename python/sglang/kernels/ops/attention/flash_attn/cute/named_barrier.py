@@ -10,6 +10,7 @@ class NamedBarrierFwd(enum.IntEnum):
     WarpSchedulerWG3 = enum.auto()
     PFull = enum.auto()
     PEmpty = enum.auto()
+    KVTranspose = enum.auto()  # SM90 native FP8: producer WG V staging -> sV
 
 
 class NamedBarrierFwdSm100(enum.IntEnum):

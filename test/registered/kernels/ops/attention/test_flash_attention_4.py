@@ -1658,6 +1658,97 @@ class TestFlashAttention4SM90(CustomTestCase):
                     out.float(), torch.cat(refs), atol=0.01, rtol=0.01
                 )
 
+    def test_paged_fp8_kv(self):
+        """E4M3 Q/K/V on the paged path (FP8 wgmma, P rounded to E4M3, bf16
+        output) matches a float reference across decode, prefill, split-KV,
+        paging, windows and descales. Lengths cover a single KV block and a
+        ragged multi-block tail."""
+        cases = (
+            # dim, kv_heads, page_size, q_len, splits, pack, descale, window
+            (256, 4, 1, 1, 1, True, False, (-1, -1)),
+            (256, 4, 1, 4, 3, True, True, (-1, -1)),
+            (256, 4, 1, 300, 1, True, True, (-1, -1)),
+            (256, 4, 64, 17, 1, False, True, (-1, -1)),
+            (256, 4, 16, 129, 0, True, False, (-1, -1)),
+            (128, 8, 1, 33, 1, True, True, (127, 0)),
+        )
+        for dim, kv_heads, page_size, q_len, splits, pack, descale, window in cases:
+            with self.subTest(
+                dim=dim,
+                page=page_size,
+                q_len=q_len,
+                splits=splits,
+                window=window,
+            ):
+                torch.manual_seed(42)
+                lengths = (max(q_len, 7), 1103)
+                pages_per_seq = (max(lengths) + page_size - 1) // page_size
+                table = (
+                    torch.randperm(2 * pages_per_seq, device="cuda")
+                    .reshape(2, -1)
+                    .int()
+                )
+                q = torch.randn(2 * q_len, 24, dim, device="cuda").to(
+                    torch.float8_e4m3fn
+                )
+                shape = (2 * pages_per_seq, page_size, kv_heads, dim)
+                k = torch.randn(shape, device="cuda").to(torch.float8_e4m3fn)
+                v = torch.randn(shape, device="cuda").to(torch.float8_e4m3fn)
+                q_descale = torch.ones(2, kv_heads, device="cuda")
+                k_descale = torch.ones(2, kv_heads, device="cuda")
+                v_descale = torch.ones(2, kv_heads, device="cuda")
+                kwargs = {}
+                if descale:
+                    k_descale.uniform_(0.5, 2.0)
+                    v_descale.uniform_(0.5, 2.0)
+                    q_descale.uniform_(0.5, 2.0)
+                    kwargs = dict(
+                        q_descale=q_descale, k_descale=k_descale, v_descale=v_descale
+                    )
+                out = flash_attn_with_kvcache_v4(
+                    q,
+                    k,
+                    v,
+                    page_table=table,
+                    cache_seqlens=torch.tensor(
+                        lengths, device="cuda", dtype=torch.int32
+                    ),
+                    cu_seqlens_q=torch.tensor(
+                        [0, q_len, 2 * q_len], device="cuda", dtype=torch.int32
+                    ),
+                    max_seqlen_q=q_len,
+                    causal=True,
+                    window_size=window,
+                    num_splits=splits,
+                    pack_gqa=pack,
+                    **kwargs,
+                )
+                self.assertEqual(out.dtype, torch.bfloat16)
+                refs = []
+                for batch, length in enumerate(lengths):
+                    kb = k[table[batch].long()].reshape(-1, kv_heads, dim)[:length]
+                    vb = v[table[batch].long()].reshape(-1, kv_heads, dim)[:length]
+                    kb = kb.float() * k_descale[batch][None, :, None]
+                    vb = vb.float() * v_descale[batch][None, :, None]
+                    kb = kb.repeat_interleave(24 // kv_heads, dim=1)
+                    vb = vb.repeat_interleave(24 // kv_heads, dim=1)
+                    qb = q[batch * q_len : (batch + 1) * q_len].float()
+                    qb = qb * q_descale[batch].repeat_interleave(24 // kv_heads)[
+                        None, :, None
+                    ]
+                    scores = torch.einsum("qhd,khd->hqk", qb, kb) / math.sqrt(dim)
+                    pos = torch.arange(q_len, device="cuda") + length - q_len
+                    keys = torch.arange(length, device="cuda")
+                    mask = keys[None, :] <= pos[:, None]
+                    if window[0] >= 0:
+                        mask &= keys[None, :] >= pos[:, None] - window[0]
+                    scores.masked_fill_(~mask[None, :, :], -torch.inf)
+                    refs.append(torch.einsum("hqk,khd->qhd", scores.softmax(-1), vb))
+                # The kernel also rounds P to E4M3 before the PV GEMM.
+                torch.testing.assert_close(
+                    out.float(), torch.cat(refs), atol=0.12, rtol=0.05
+                )
+
     def test_image_mask(self):
         """Future tokens are visible only within one image, also after a prefix.
 

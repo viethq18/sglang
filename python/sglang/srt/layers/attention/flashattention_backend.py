@@ -310,6 +310,8 @@ class FlashAttentionBackend(AttentionBackend):
         device_capability = get_device_capability()
         # SM120 FA4 runs FP8 KV natively for prefill and head dims above 256.
         self.fa4_sm120 = self.fa_impl_ver == 4 and device_capability[0] == 12
+        # SM90 FA4 runs E4M3 KV natively: Q is cast to E4M3 and both GEMMs are FP8 wgmma.
+        self.fa4_sm90 = self.fa_impl_ver == 4 and device_capability[0] == 9
         # FP8-KV GQA calls that the Triton kernels in paged_gqa_fp8_sm120 accept go
         # there instead of FA4; the kernels index the KV cache per token, so page size 1.
         self.use_paged_gqa_fp8 = (
@@ -1482,6 +1484,7 @@ class FlashAttentionBackend(AttentionBackend):
             and not self.kv_cache_is_mxfp8
             and (
                 self.fa4_sm120
+                or self.fa4_sm90
                 or (layer.head_dim <= 256 and (not is_prefill or self.fa_impl_ver != 4))
             )
         ):
