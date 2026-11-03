@@ -857,6 +857,12 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    if fp8_native_sm90 and tile_mn is None:
+        # Decode-shaped work (<= 64 query rows per KV head) fills only half of a
+        # 128-row tile; one MMA warpgroup then halves the per-tile V transpose.
+        # Measured crossover: tile_m=64 wins at <= 64 rows, loses beyond.
+        if (seqlen_q_packgqa if pack_gqa else max_seqlen_q) <= 64:
+            tile_m = 64
     if arch // 10 in [10, 11]:
         # q_stage=2 hangs on sm100 for qk_blockscaled; force q_stage=1 there.
         q_stage = 1 if qk_blockscaled else (2 if seqlen_q_packgqa > tile_m else 1)

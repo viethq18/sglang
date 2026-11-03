@@ -92,6 +92,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             assert self.tile_n == 64, "SM90 FP8 V transpose assumes tile_n == 64"
             assert not self.Q_in_regs, "SM90 FP8 does not support Q_in_regs"
             assert self.tile_hdim == self.tile_hdimv, "SM90 FP8 requires hdim == hdimv"
+            # V staging ring depth: transpose block i while blocks i+1 and i+2
+            # are in flight (load_KV_fp8_native's wait_group(2) assumes 3).
+            self.num_vstage_fp8 = 3
         self.has_bias = has_bias
         self.rel_extent_padded = rel_extent_padded
         if has_bias:
@@ -270,10 +273,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 ],
                 1024,
             ]
-            # Two row-major (n, hdimv) V tiles landed by cp.async; the producer
-            # transposes one into sV while the next block's copy is in flight.
+            # Row-major (n, hdimv) V tiles landed by cp.async; the producer
+            # transposes one into sV while the next two blocks' copies are in flight.
             sVStage_struct = cute.struct.Align[
-                cute.struct.MemRange[self.dtype, 2 * self.tile_n * self.tile_hdimv],
+                cute.struct.MemRange[
+                    self.dtype, self.num_vstage_fp8 * self.tile_n * self.tile_hdimv
+                ],
                 1024,
             ]
 
@@ -840,18 +845,20 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sVt = layout_utils.transpose_view(sV)
         sVStage, sVStage_u32, sV_u32 = None, None, None
         if const_expr(self.is_fp8):
-            # Two row-major (n, hdimv) fp8 tiles. The 16B-chunk XOR swizzle
-            # S<3,4,4> makes the transpose's u32 reads bank-conflict free.
+            # num_vstage_fp8 row-major (n, hdimv) fp8 tiles. The 16B-chunk XOR
+            # swizzle S<3,4,4> makes the transpose's u32 reads bank-conflict free.
             sVStage = storage.sVStage.get_tensor(
                 cute.make_layout(
-                    (self.tile_n, self.tile_hdimv, 2),
+                    (self.tile_n, self.tile_hdimv, self.num_vstage_fp8),
                     stride=(self.tile_hdimv, 1, self.tile_n * self.tile_hdimv),
                 ),
                 swizzle=cute.make_swizzle(3, 4, 4),
             )
             # Raw u32 views for the transpose (swizzles applied by hand).
             sVStage_u32 = storage.sVStage.get_tensor(
-                cute.make_layout(2 * self.tile_n * self.tile_hdimv // 4),
+                cute.make_layout(
+                    self.num_vstage_fp8 * self.tile_n * self.tile_hdimv // 4
+                ),
                 dtype=Int32,
             )
             sV_u32 = storage.sV.get_tensor(
@@ -1454,48 +1461,58 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         n_block_max: Int32,
     ) -> pipeline.PipelineState:
         """Native FP8 producer: cp.async K straight into sK; cp.async V into a
-        row-major staging buffer one block ahead and transpose it into the
+        row-major staging ring two blocks ahead and transpose it into the
         K-major sV stage the e4m3 PV wgmma needs.
 
         The page table manager caches one block's pages, so each block issues
-        K before V. The barrier at the top of iteration i (after every thread's
-        V(n) copy landed) also guarantees nobody still reads the staging buffer
-        that V(n-1) is about to overwrite.
+        K before V. Every block commits two cp.async groups (K, V), so with
+        block i+1 still in flight `wait_group(2)` lands V(i). The barrier at the
+        top of iteration i (after every thread's V(i) copy landed) also
+        guarantees nobody still reads staging slot (i-1) % 3 that V(i+2) is
+        about to overwrite.
         """
+        num_vstage = self.num_vstage_fp8
         n_block = cutlass.max(n_block_max - 1, 0)
         num_blocks = cutlass.max(n_block_max - n_block_min, 1)
-        paged_kv_manager.load_page_table(n_block)
-        pipeline_k.producer_acquire(producer_state)
-        paged_kv_manager.load_KV(n_block, sK[None, None, producer_state.index], "K")
-        cute.arch.cp_async_commit_group()
-        pipeline_k.producer_commit(producer_state)
-        paged_kv_manager.load_KV(n_block, sVStage[None, None, 0], "V")
-        cute.arch.cp_async_commit_group()
+        load_state = producer_state.clone()
+        for j in cutlass.range_constexpr(num_vstage - 1):
+            if j == 0 or j < num_blocks:
+                paged_kv_manager.load_page_table(n_block - j)
+                pipeline_k.producer_acquire(load_state)
+                paged_kv_manager.load_KV(
+                    n_block - j, sK[None, None, load_state.index], "K"
+                )
+                cute.arch.cp_async_commit_group()
+                pipeline_k.producer_commit(load_state)
+                paged_kv_manager.load_KV(n_block - j, sVStage[None, None, j], "V")
+                cute.arch.cp_async_commit_group()
+                load_state.advance()
         for i in cutlass.range(num_blocks, unroll=1):
-            cute.arch.cp_async_wait_group(0)
+            if i + 1 < num_blocks:
+                cute.arch.cp_async_wait_group(2)
+            else:
+                cute.arch.cp_async_wait_group(0)
             cute.arch.barrier(
                 barrier_id=int(NamedBarrierFwd.KVTranspose),
                 number_of_threads=self.num_threads_per_warp_group,
             )
-            if i + 1 < num_blocks:
-                next_state = producer_state.clone()
-                next_state.advance()
-                paged_kv_manager.load_page_table(n_block - 1)
-                pipeline_k.producer_acquire(next_state)
-                paged_kv_manager.load_KV(
-                    n_block - 1, sK[None, None, next_state.index], "K"
-                )
-                cute.arch.cp_async_commit_group()
-                pipeline_k.producer_commit(next_state)
-                paged_kv_manager.load_KV(
-                    n_block - 1, sVStage[None, None, (i + 1) % 2], "V"
-                )
-                cute.arch.cp_async_commit_group()
             pipeline_v.producer_acquire(producer_state)
-            self.transpose_V_fp8(sVStage_u32, sV_u32, i % 2, producer_state.index)
+            self.transpose_V_fp8(sVStage_u32, sV_u32, i % num_vstage, producer_state.index)
             # Make the generic-proxy smem writes visible to wgmma (async proxy).
             cute.arch.fence_view_async_shared()
             pipeline_v.producer_commit(producer_state)
+            if i + num_vstage - 1 < num_blocks:
+                nb = n_block - (num_vstage - 1)
+                paged_kv_manager.load_page_table(nb)
+                pipeline_k.producer_acquire(load_state)
+                paged_kv_manager.load_KV(nb, sK[None, None, load_state.index], "K")
+                cute.arch.cp_async_commit_group()
+                pipeline_k.producer_commit(load_state)
+                paged_kv_manager.load_KV(
+                    nb, sVStage[None, None, (i + num_vstage - 1) % num_vstage], "V"
+                )
+                cute.arch.cp_async_commit_group()
+                load_state.advance()
             producer_state.advance()
             n_block -= 1
         return producer_state
