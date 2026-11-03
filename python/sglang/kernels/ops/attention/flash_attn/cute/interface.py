@@ -570,6 +570,16 @@ def _flash_attn_fwd(
     # qk_blockscaled: Q/K are fp8 (same dtype); V may be bf16 (no v_blockscaled) or
     # fp8 (v_blockscaled) -- exclude V from the cross-dtype check either way.
     # v_blockscaled without qk_blockscaled: Q/K bf16, V fp8 -- exclude V.
+    # SM90 native FP8: E4M3 Q/K/V computed as FP8 wgmma end to end.
+    fp8_native_sm90 = (
+        arch // 10 == 9
+        and arch_forward_host is None
+        and not qk_blockscaled
+        and not v_blockscaled
+        and q is not None
+        and q.dtype == torch.float8_e4m3fn
+        and v.dtype == torch.float8_e4m3fn
+    )
     if qk_blockscaled:
         input_tensors = {"q": q, "k": k, "qv": qv}
     elif v_blockscaled:
@@ -742,10 +752,26 @@ def _flash_attn_fwd(
                     else t.contiguous()
                     for t in (q_descale, k_descale, v_descale)
                 )
+        elif fp8_native_sm90:
+            assert page_table is not None, "SM90 FA4 FP8 requires paged KV"
+            assert qv is None, "SM90 FA4 FP8 does not support qv"
+            assert rel_bias is None, "SM90 FA4 FP8 does not support rel_bias"
+            assert head_dim <= 256, "SM90 FA4 FP8 supports head_dim <= 256"
+            if any(t is not None for t in (q_descale, k_descale, v_descale)):
+                # Same positional DescaleTensors rebuild as SM120: fill missing
+                # slots with unit scales and materialize expand() views.
+                q_descale, k_descale, v_descale = (
+                    torch.ones(
+                        (batch_size, num_head_kv), dtype=torch.float32, device=device
+                    )
+                    if t is None
+                    else t.contiguous()
+                    for t in (q_descale, k_descale, v_descale)
+                )
         else:
             assert (
                 arch // 10 == 10
-            ), "FP8 is only supported on SM100 and SM120 for FA4 CuTe."
+            ), "FP8 is only supported on SM100, SM120, and SM90 (paged) for FA4 CuTe."
     use_block_sparsity = block_sparse_tensors is not None
 
     causal, local, window_size_left, window_size_right = _resolve_causal_local_window(
@@ -815,6 +841,10 @@ def _flash_attn_fwd(
             tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap
         )
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if fp8_native_sm90:
+        # The fp8 V transpose staging must fit next to the Q/K/V stages;
+        # tile_n=64 keeps hdim 256 within SM90 smem.
+        tile_n = 64
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -827,6 +857,12 @@ def _flash_attn_fwd(
     if cu_seqlens_k is None and seqused_k is None:
         min_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
+    if fp8_native_sm90 and tile_mn is None:
+        # Decode-shaped work (<= 64 query rows per KV head) fills only half of a
+        # 128-row tile; one MMA warpgroup then halves the per-tile V transpose.
+        # Measured crossover: tile_m=64 wins at <= 64 rows, loses beyond.
+        if (seqlen_q_packgqa if pack_gqa else max_seqlen_q) <= 64:
+            tile_m = 64
     if arch // 10 in [10, 11]:
         # q_stage=2 hangs on sm100 for qk_blockscaled; force q_stage=1 there.
         q_stage = 1 if qk_blockscaled else (2 if seqlen_q_packgqa > tile_m else 1)
@@ -1335,7 +1371,8 @@ def _flash_attn_fwd(
         arch,
         arch_forward_config.compile_key if arch_forward_config is not None else None,
         arch_forward_plan.compile_key if arch_forward_plan is not None else None,
-        page_size not in [None, tile_n],  # paged KV non-TMA
+        page_size not in [None, tile_n] or fp8_native_sm90,  # paged non-TMA
+        fp8_native_sm90,
         use_2cta_instrs,
         q_subtile_factor,
         mma_pv_is_rs,
@@ -1486,7 +1523,7 @@ def _flash_attn_fwd(
                 score_mod=score_mod,
                 has_aux_tensors=aux_tensors is not None,
                 q_subtile_factor=q_subtile_factor,
-                paged_kv_non_tma=page_size not in [None, tile_n],
+                paged_kv_non_tma=page_size not in [None, tile_n] or fp8_native_sm90,
                 has_bias=bias is not None,
                 bias_block_size=tile_bias,
                 rel_extent_padded=rel_extent_padded,
@@ -1664,7 +1701,7 @@ def _flash_attn_fwd(
                 window_size_right,
                 learnable_sink_tensor,
             ]
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 compile_args.append(descale_tensors_tensor)
             compile_args.extend(
                 [
@@ -1761,7 +1798,7 @@ def _flash_attn_fwd(
                 window_size_right,
                 learnable_sink,
             ]
-            if arch // 10 in [10, 11]:
+            if arch // 10 in [9, 10, 11]:
                 call_args.append(descale_tensors)
             call_args.extend(
                 [

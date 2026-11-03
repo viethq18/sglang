@@ -210,7 +210,7 @@ class FlashAttentionForwardBase:
             if const_expr(mO_type != Float32):
                 raise TypeError("SplitKV partial output (mO) must be Float32")
         elif const_expr(self.o_dtype != self.dtype):
-            # Quantized Q/K/V (SM120 FP8 KV) with a wider output dtype.
+            # Quantized Q/K/V (SM120 / SM90 native FP8) with a wider output dtype.
             if const_expr(not (mQ_type == mK_type == mV_type)):
                 raise TypeError("Q/K/V must have the same data type")
             if const_expr(mO_type != self.o_dtype):
@@ -221,7 +221,7 @@ class FlashAttentionForwardBase:
             mQ_type not in [cutlass.Float16, cutlass.BFloat16]
             and not (self.o_dtype != self.dtype and mQ_type == cutlass.Float8E4M3FN)
         ):
-            raise TypeError("Only Float16, BFloat16 or SM120 FP8 KV is supported")
+            raise TypeError("Only Float16, BFloat16 or FP8 E4M3 Q/K/V is supported")
         if const_expr(mLSE_type not in [None, Float32]):
             raise TypeError("LSE tensor must be Float32")
         if const_expr(mCuSeqlensQ_type not in [None, Int32]):
