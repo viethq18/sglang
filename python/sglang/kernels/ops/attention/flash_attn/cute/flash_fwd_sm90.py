@@ -1842,6 +1842,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             has_work = True
             if const_expr(self.is_split_kv):
                 has_work = n_block_min < n_block_max
+                # Empty splits emit O = 0. Reset up front rather than in an `else`
+                # of the runtime `if has_work` below: writing acc_O under that
+                # divergent branch demotes acc_O to local memory for the whole
+                # mainloop (~6x slower). Non-empty splits overwrite both anyway
+                # (zero_init PV, is_first softmax).
+                softmax.reset()
+                acc_O.fill(0.0)
 
             # ==========================================
             # MAINLOOP
@@ -1973,9 +1980,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         O_should_accumulate = True
                     else:
                         self.warp_scheduler_barrier_arrive()
-                else:
-                    softmax.reset()
-                    acc_O.fill(0.0)
 
             else:
                 # ==========================================
