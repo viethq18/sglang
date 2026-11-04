@@ -1333,6 +1333,10 @@ class Envs:
     # SM120 FA4 backend: route FP8-KV Gemma-style GQA attention to the Triton kernels in
     # paged_gqa_fp8_sm120 (HD512/HD256 decode and verify, HD512 full-attention prefill).
     SGLANG_SM120_PAGED_GQA_FP8 = EnvBool(True)
+    # SM90 FA4 backend: send E4M3 prefill attention (query >= 64 tokens, head dims
+    # <= 256) through FA3's FP8 kernel, ~1.5x faster on H100; decode/verify and
+    # FA4-only features stay on FA4. Not applied with deterministic inference.
+    SGLANG_FA4_SM90_FP8_PREFILL_VIA_FA3 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)

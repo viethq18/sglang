@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import functools
+import inspect
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
@@ -85,6 +87,42 @@ from sgl_kernel import merge_state_v2
 
 def _should_disable_scheduler_metadata_precompute() -> bool:
     return bool(get_parallel().enable_prefill_cp or get_parallel().attn_dp_enabled)
+
+
+# Shortest query that counts as prefill: decode and speculative verify stay on FA4.
+_FA3_FP8_PREFILL_MIN_Q = 64
+
+
+def _route_fp8_prefill_to_fa3(fa4_fn: Callable, fa3_fn: Callable) -> Callable:
+    """FA4 ``flash_attn_with_kvcache`` with FP8 prefill calls sent to FA3.
+
+    On SM90, FA3's FP8 kernel runs E4M3 prefill attention ~1.5x faster than
+    FA4's (hdim 256: ~1.05 vs ~0.68 PFLOP/s). A call goes to FA3 only when the
+    query is E4M3, both head dims are <= 256, the query is prefill-sized, and it
+    sets no keyword FA3 lacks (score/mask mods, block-scaled sf*, rel_bias);
+    every other call stays on FA4."""
+    fa3_params = frozenset(inspect.signature(fa3_fn).parameters)
+
+    @functools.wraps(fa4_fn)
+    def flash_attn_with_kvcache(*args, **kwargs):
+        q, v_cache = kwargs.get("q"), kwargs.get("v_cache")
+        max_seqlen_q = kwargs.get("max_seqlen_q")
+        if (
+            not args
+            and q is not None
+            and v_cache is not None
+            and q.dtype == torch.float8_e4m3fn
+            and q.shape[-1] <= 256
+            and v_cache.shape[-1] <= 256
+            and isinstance(max_seqlen_q, int)
+            and max_seqlen_q >= _FA3_FP8_PREFILL_MIN_Q
+            and all(v is None for k, v in kwargs.items() if k not in fa3_params)
+        ):
+            return fa3_fn(**{k: v for k, v in kwargs.items() if k in fa3_params})
+        return fa4_fn(*args, **kwargs)
+
+    return flash_attn_with_kvcache
+
 
 
 @dataclass
@@ -421,6 +459,17 @@ class FlashAttentionBackend(AttentionBackend):
                 )
 
                 set_batch_invariant(True)
+            elif (
+                device_capability[0] == 9
+                and envs.SGLANG_FA4_SM90_FP8_PREFILL_VIA_FA3.get()
+            ):
+                from sglang.kernels.ops.attention.flash_attention_v3 import (
+                    flash_attn_with_kvcache as fa3_flash_attn_with_kvcache,
+                )
+
+                flash_attn_with_kvcache = _route_fp8_prefill_to_fa3(
+                    flash_attn_with_kvcache, fa3_flash_attn_with_kvcache
+                )
         else:
             raise ValueError(f"Invalid version: {self.fa_impl_ver=}")
 
