@@ -88,15 +88,19 @@ def make_runner(
 
 class TestGDNPrefillGraphExtend(CustomTestCase):
     @contextmanager
-    def _setup(self, *, cuda=True, enable_mis=False, draft=False):
+    def _setup(self, *, cuda=True, enable_mis=False, draft=False, triton_prefill=True):
         """A target's GDN backend on a setup the graph-safe chain supports, unless
-        cuda, enable_mis or draft say otherwise."""
+        cuda, enable_mis, draft or a non-Triton eager prefill say otherwise."""
         backend = GDNAttnBackend.__new__(GDNAttnBackend)
         backend.is_draft_worker = draft
         backend.enable_mis = enable_mis
         backend._mamba_chunk_size = 64
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+            extend_kernel=(
+                TritonGDNKernel.__new__(TritonGDNKernel)
+                if triton_prefill
+                else sentinel.flashinfer_extend_kernel
+            )
         )
         cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
         backend.state_pool = SimpleNamespace(mamba_cache=cache)
@@ -123,20 +127,62 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
     def test_the_switch_captures_the_extend_only_where_the_setup_supports_it(self):
         """Off, the default, breakable prefill graphs keep breaking at every GDN
         layer; on, they capture the target's extend only where this setup supports
-        the graph-safe chain, and a draft's prefill graphs keep their eager path."""
-        for switch, setup, captured in (
-            (False, {}, False),
-            (True, {}, True),
-            (True, dict(cuda=False), False),
-            (True, dict(enable_mis=True), False),
-            (True, dict(draft=True), False),
+        the graph-safe chain, and a draft's prefill graphs keep their eager path.
+        A non-Triton eager prefill is captured only when a token cap keeps the
+        large buckets breaking to it."""
+        for switch, max_tokens, setup, captured in (
+            (False, 0, {}, False),
+            (True, 0, {}, True),
+            (True, 0, dict(cuda=False), False),
+            (True, 0, dict(enable_mis=True), False),
+            (True, 0, dict(draft=True), False),
+            (True, 0, dict(triton_prefill=False), False),
+            (True, 2048, dict(triton_prefill=False), True),
+            (False, 2048, dict(triton_prefill=False), False),
         ):
             with (
-                self.subTest(switch=switch, **setup),
+                self.subTest(switch=switch, max_tokens=max_tokens, **setup),
                 envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.override(switch),
+                envs.SGLANG_LINEAR_PREFILL_GRAPH_EXTEND_MAX_TOKENS.override(
+                    max_tokens
+                ),
                 self._setup(**setup) as backend,
             ):
                 self.assertEqual(backend.supports_prefill_graph_extend(), captured)
+
+    def test_buckets_past_the_token_cap_break_at_the_linear_layers(self):
+        """Buckets up to the cap capture the linear extend on static tables;
+        larger ones run the eager linear metadata and break at each layer."""
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
+
+        hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
+        hybrid.full_attn_backend = MagicMock()
+        for max_tokens, num_tokens, captured in (
+            (0, 8192, True),
+            (2048, 2048, True),
+            (2048, 2049, False),
+            (2048, 128, True),
+        ):
+            linear = MagicMock()
+            linear.init_prefill_graph_metadata.return_value = sentinel.meta
+            hybrid.linear_attn_backend = linear
+            batch = SimpleNamespace(
+                forward_mode=ForwardMode.EXTEND,
+                positions=torch.zeros(num_tokens, dtype=torch.int64),
+            )
+            with (
+                self.subTest(max_tokens=max_tokens, num_tokens=num_tokens),
+                envs.SGLANG_LINEAR_PREFILL_GRAPH_EXTEND_MAX_TOKENS.override(
+                    max_tokens
+                ),
+            ):
+                meta = hybrid.init_forward_metadata_for_breakable_cuda_graph_capture(
+                    batch
+                )
+                self.assertIs(meta, sentinel.meta if captured else None)
+                self.assertEqual(linear.init_forward_metadata.called, not captured)
 
 
 class TestFlashInferGDNPrefillBackendPolicy(CustomTestCase):

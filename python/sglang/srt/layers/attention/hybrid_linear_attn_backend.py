@@ -1358,7 +1358,12 @@ class HybridLinearAttnBackend(AttentionBackend):
         self, forward_batch: ForwardBatch
     ):
         self.full_attn_backend.init_forward_metadata(forward_batch)
-        if not self._is_plain_extend(forward_batch):
+        max_tokens = envs.SGLANG_LINEAR_PREFILL_GRAPH_EXTEND_MAX_TOKENS.get()
+        if not self._is_plain_extend(forward_batch) or (
+            0 < max_tokens < forward_batch.positions.shape[0]
+        ):
+            # Larger buckets break at the linear layers: their eager extend
+            # beats the captured one's bucket-padded grids.
             if not forward_batch.forward_mode.is_draft_extend_v2():
                 self.linear_attn_backend.init_forward_metadata(forward_batch)
             return None

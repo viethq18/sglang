@@ -284,6 +284,9 @@ class GDNKernelDispatcher:
     ):
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
+        # The captured prefill extend (gdn_prefill_graph.py) runs on Triton's
+        # static-table chunk kernels whatever the eager prefill backend is.
+        self.graph_extend_kernel = triton_kernel
 
         cutedsl_kernel = None
         if decode_backend.is_triton():
@@ -597,7 +600,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
         capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
         supported = (
             is_cuda()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+            # A non-Triton eager prefill pairs with the Triton graph extend only
+            # when large buckets keep breaking to it.
+            and (
+                isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
+                or envs.SGLANG_LINEAR_PREFILL_GRAPH_EXTEND_MAX_TOKENS.get() > 0
+            )
             and not self.enable_mis
             # The track plan's h rows assume the delta-rule chunk size.
             and self.mamba_chunk_size == FLA_CHUNK_SIZE
@@ -1159,7 +1167,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
-        core_attn_out, _, h = self.kernel_dispatcher.extend(
+        core_attn_out, _, h = self.kernel_dispatcher.graph_extend_kernel.extend(
             q=query,
             k=key,
             v=value,

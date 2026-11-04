@@ -1854,6 +1854,10 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Largest breakable prefill CUDA graph bucket (tokens) whose linear-attention
+    # extend is captured; larger buckets break at the linear layers and run the
+    # eager extend (which may then use a non-Triton prefill kernel). 0 = all.
+    SGLANG_LINEAR_PREFILL_GRAPH_EXTEND_MAX_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls
