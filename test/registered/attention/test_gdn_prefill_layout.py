@@ -170,6 +170,28 @@ class TestGdnPrefillLayout(unittest.TestCase):
         torch.testing.assert_close(q_out, l2norm_fwd(q[0]), rtol=0, atol=0)
         torch.testing.assert_close(k_out, l2norm_fwd(k[0]), rtol=0, atol=0)
 
+    def test_fused_split_wide_projection_matches_torch_split(self):
+        # Feature widths beyond one tile, incl. a non-power-of-two tail and
+        # q/k/v boundaries that fall inside a tile.
+        for heads in ((16, 16, 48, 128), (12, 12, 40, 128), (5, 5, 13, 128)):
+            nq, nk, nv, hd = heads
+            with self.subTest(heads=heads):
+                dims = [nq * hd, nk * hd, nv * hd]
+                qkvz = torch.randn(
+                    37, sum(dims) + 512, dtype=torch.bfloat16, device="cuda"
+                )
+                mixed_qkv = qkvz[:, : sum(dims)]
+                q, k, v = fused_qkv_split_gdn_prefill(
+                    mixed_qkv, nq, nk, nv, hd, hd, hd
+                )
+                for out, ref, n in zip(
+                    (q, k, v), torch.split(mixed_qkv, dims, dim=-1), (nq, nk, nv)
+                ):
+                    self.assertTrue(out.is_contiguous())
+                    torch.testing.assert_close(
+                        out, ref.reshape(1, 37, n, hd), rtol=0, atol=0
+                    )
+
     def test_strided_gate_matches_contiguous_gate(self):
         for dtype in (torch.bfloat16, torch.float16):
             for norm_before_gate in (True, False):

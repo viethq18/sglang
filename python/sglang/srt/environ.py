@@ -302,6 +302,11 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Dense SwiGLU + block-FP8 activation quant fusion beyond SM100 decode:
+    # also SM90 DeepGEMM (fp32 column-major scales) and every forward mode
+    # (extend/verify/prefill). Bitwise-equal to the unfused path; unsupported
+    # inputs fall back to the original activation.
+    SGLANG_DENSE_SWIGLU_FP8_FUSION_EXT = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device
@@ -1328,6 +1333,10 @@ class Envs:
     # SM120 FA4 backend: route FP8-KV Gemma-style GQA attention to the Triton kernels in
     # paged_gqa_fp8_sm120 (HD512/HD256 decode and verify, HD512 full-attention prefill).
     SGLANG_SM120_PAGED_GQA_FP8 = EnvBool(True)
+    # SM90 FA4 backend: send E4M3 prefill attention (query >= 64 tokens, head dims
+    # <= 256) through FA3's FP8 kernel, ~1.5x faster on H100; decode/verify and
+    # FA4-only features stay on FA4. Not applied with deterministic inference.
+    SGLANG_FA4_SM90_FP8_PREFILL_VIA_FA3 = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1845,6 +1854,10 @@ class Envs:
     # Sequences a captured GDN extend bucket accepts (at most the request pool); a
     # larger prefill batch runs the step eagerly. Bounds the padded grids and scratch.
     SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS = EnvInt(128)
+    # Largest breakable prefill CUDA graph bucket (tokens) whose linear-attention
+    # extend is captured; larger buckets break at the linear layers and run the
+    # eager extend (which may then use a non-Triton prefill kernel). 0 = all.
+    SGLANG_LINEAR_PREFILL_GRAPH_EXTEND_MAX_TOKENS = EnvInt(0)
 
     # ===================================================================
     # Tokenizer, request state, embeddings, and reasoning controls

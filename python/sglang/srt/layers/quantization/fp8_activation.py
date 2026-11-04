@@ -23,13 +23,27 @@ if TYPE_CHECKING:
 
 
 class DenseSiluAndMulQuant:
-    """Keep the normal activation unless down_proj can consume our FP8 tuple."""
+    """Keep the normal activation unless down_proj can consume our FP8 tuple.
+
+    SM100 DeepGEMM takes column-major packed UE8M0 scales and is fused on
+    decode by default. ``SGLANG_DENSE_SWIGLU_FP8_FUSION_EXT`` adds SM90
+    DeepGEMM (column-major, TMA-aligned fp32 scales) and every forward mode.
+    Either way the tuple matches the scales down_proj's own quantizer emits.
+    """
 
     def __init__(self, down_proj: RowParallelLinear) -> None:
+        from sglang.srt.environ import envs
+
         self.enabled = False
+        self.all_modes = envs.SGLANG_DENSE_SWIGLU_FP8_FUSION_EXT.get()
         self.down_proj = down_proj
         self.quant_method = down_proj.quant_method
-        if not (is_cuda() and get_platform().is_sm100 and get_parallel().tp_size == 1):
+        platform = get_platform()
+        if not (
+            is_cuda()
+            and (platform.is_sm100 or (self.all_modes and platform.is_sm90))
+            and get_parallel().tp_size == 1
+        ):
             return
 
         from sglang.srt.layers import deep_gemm_wrapper
@@ -40,6 +54,11 @@ class DenseSiluAndMulQuant:
             deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 
+        # SM100 consumes packed UE8M0; SM90 consumes fp32 scales.
+        self.scale_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+        if self.scale_ue8m0 != platform.is_sm100:
+            return
+
         method = self.quant_method
         if not (
             type(down_proj) is RowParallelLinear
@@ -47,13 +66,15 @@ class DenseSiluAndMulQuant:
             and method.weight_block_size == [128, 128]
             and method.quant_config.activation_scheme == "dynamic"
             and not (method.use_marlin or method.use_mxfp8 or method.block_fp8_as_mxfp8)
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
             and down_proj.input_is_parallel
         ):
             return
         backend = method.w8a8_block_fp8_linear
         if isinstance(backend, partial):
             if backend.args or set(backend.keywords) - {"act_scale_ue8m0"}:
+                return
+            # SM90 quantizes UE8M0 checkpoints with row-major fp32 pow-2 scales.
+            if not self.scale_ue8m0 and backend.keywords.get("act_scale_ue8m0"):
                 return
             backend = backend.func
         # The supported loader preserves matrix geometry, not tensor identity/device.
@@ -65,13 +86,21 @@ class DenseSiluAndMulQuant:
             )
         )
 
-    def forward_decode(
+    def applies(self, forward_batch) -> bool:
+        """Whether the caller should route its activation through ``forward``."""
+        if not self.enabled:
+            return False
+        if self.all_modes:
+            return True
+        return forward_batch is not None and forward_batch.forward_mode.is_decode()
+
+    def forward(
         self,
         x: torch.Tensor,
         act_fn: SiluAndMul,
         down_proj: RowParallelLinear,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Try fusion for decode; callers must bypass this helper in other modes."""
+        """Fused activation for modes accepted by ``applies``."""
         if not self.enabled or torch.compiler.is_compiling():
             return act_fn(x)
 
@@ -112,7 +141,7 @@ class DenseSiluAndMulQuant:
         return per_token_group_quant(
             x,
             group_size=128,
-            scale_ue8m0=True,
+            scale_ue8m0=self.scale_ue8m0,
             column_major_scales=True,
             fuse_silu_and_mul=True,
             silu_and_mul_mode="dense",

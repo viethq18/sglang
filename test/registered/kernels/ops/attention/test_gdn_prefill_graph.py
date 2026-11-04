@@ -5,7 +5,8 @@ One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
 unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
 match the eager path bit for bit on the output, the conv / SSM state pools and
-the track slots, for FP32 and BF16 SSM states.
+the track slots, for FP32 and BF16 SSM states. A backend whose eager prefill is
+FlashInfer still captures the Triton chain, so it matches the same reference.
 """
 
 import unittest
@@ -20,6 +21,9 @@ from sglang.srt.layers.attention.linear.gdn_backend import (
 )
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
     GDNPrefillGraphMetadata,
+)
+from sglang.srt.layers.attention.linear.kernels.gdn_flashinfer import (
+    is_flashinfer_gdn_prefill_available,
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
@@ -62,7 +66,7 @@ def _layer():
     )
 
 
-def _backend(conv_pool, ssm_pool):
+def _backend(conv_pool, ssm_pool, prefill=LinearAttnKernelBackend.TRITON):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
     backend.state_pool = None
@@ -89,7 +93,7 @@ def _backend(conv_pool, ssm_pool):
     backend.prefill_graph_metadata = None
     backend.kernel_dispatcher = GDNKernelDispatcher(
         LinearAttnKernelBackend.TRITON,
-        LinearAttnKernelBackend.TRITON,
+        prefill,
         LinearAttnKernelBackend.TRITON,
     )
     return backend
@@ -142,7 +146,7 @@ def _batch(extend_lens, prefix_lens, track=None):
 
 @unittest.skipUnless(torch.cuda.is_available(), "needs a GPU")
 class TestGDNPrefillGraph(CustomTestCase):
-    def _setup(self, ssm_dtype):
+    def _setup(self, ssm_dtype, prefill=LinearAttnKernelBackend.TRITON):
         self.layer = _layer()
         g = torch.Generator(device="cuda").manual_seed(11)
         self.conv_pool = (
@@ -154,7 +158,7 @@ class TestGDNPrefillGraph(CustomTestCase):
             )
             * 0.05
         ).to(ssm_dtype)
-        self.backend = _backend(self.conv_pool, self.ssm_pool)
+        self.backend = _backend(self.conv_pool, self.ssm_pool, prefill)
         # Static inputs the captured graph reads.
         self.mixed = torch.zeros(BUCKET, DIM, device="cuda", dtype=torch.bfloat16)
         self.a = torch.zeros(BUCKET, V_HEADS, device="cuda", dtype=torch.bfloat16)
@@ -252,11 +256,17 @@ class TestGDNPrefillGraph(CustomTestCase):
             ([200, 11], [0, 0], None),
             ([1], [900], None),
         ]
-        for ssm_dtype in (torch.float32, torch.bfloat16):
-            self._setup(ssm_dtype)
+        variants = [
+            (torch.float32, LinearAttnKernelBackend.TRITON),
+            (torch.bfloat16, LinearAttnKernelBackend.TRITON),
+        ]
+        if is_flashinfer_gdn_prefill_available():
+            variants.append((torch.bfloat16, LinearAttnKernelBackend.FLASHINFER))
+        for ssm_dtype, prefill in variants:
+            self._setup(ssm_dtype, prefill)
             meta, graph, out = self._capture()
             for i, (lens, prefixes, track) in enumerate(cases):
-                with self.subTest(ssm_dtype=ssm_dtype, case=i):
+                with self.subTest(ssm_dtype=ssm_dtype, prefill=prefill, case=i):
                     self._check_replay(
                         meta,
                         graph,
