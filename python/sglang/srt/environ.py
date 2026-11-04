@@ -302,6 +302,11 @@ class Envs:
     # Bitwise-exact, shape-guarded Qwen4 PLE decode fusion. Unsupported inputs
     # and phases fall back to the original implementation.
     SGLANG_ENABLE_QWEN4_PLE_FUSION = EnvBool(True)
+    # Dense SwiGLU + block-FP8 activation quant fusion beyond SM100 decode:
+    # also SM90 DeepGEMM (fp32 column-major scales) and every forward mode
+    # (extend/verify/prefill). Bitwise-equal to the unfused path; unsupported
+    # inputs fall back to the original activation.
+    SGLANG_DENSE_SWIGLU_FP8_FUSION_EXT = EnvBool(False)
     # --ple-offload-backend file: where the sparse, file-backed PLE table lives
     # (deterministic name, reused across restarts), whether prefill-sized
     # gathers hint the page cache first, and an escape hatch for the device

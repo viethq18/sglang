@@ -637,6 +637,9 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
     return mixed_qkv, z, b, a
 
 
+_QKV_SPLIT_MAX_BLOCK = 2048
+
+
 @triton.jit
 def fused_qkv_split_gdn_prefill_kernel(
     q,
@@ -654,7 +657,7 @@ def fused_qkv_split_gdn_prefill_kernel(
     BLOCK_SIZE: tl.constexpr,
 ):
     i_t = tl.program_id(0)
-    offsets = tl.arange(0, BLOCK_SIZE)
+    offsets = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
     q_dim: tl.constexpr = NUM_Q_HEADS * HEAD_Q
     k_dim: tl.constexpr = NUM_K_HEADS * HEAD_K
@@ -714,9 +717,11 @@ def fused_qkv_split_gdn_prefill(
     )
 
     qkv_dim = num_q_heads * head_q + num_k_heads * head_k + num_v_heads * head_v
+    # Tile the feature dim so wide projections keep a bounded block size.
+    block_size = min(triton.next_power_of_2(qkv_dim), _QKV_SPLIT_MAX_BLOCK)
     if _is_hip and seq_len == 0:
         return q, k, v
-    fused_qkv_split_gdn_prefill_kernel[(seq_len,)](
+    fused_qkv_split_gdn_prefill_kernel[(seq_len, triton.cdiv(qkv_dim, block_size))](
         q,
         k,
         v,
@@ -729,7 +734,7 @@ def fused_qkv_split_gdn_prefill(
         head_q,
         head_k,
         head_v,
-        BLOCK_SIZE=triton.next_power_of_2(qkv_dim),
+        BLOCK_SIZE=block_size,
         num_warps=8,
         num_stages=3,
     )

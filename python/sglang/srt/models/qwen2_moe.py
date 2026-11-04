@@ -74,6 +74,7 @@ from sglang.srt.layers.moe.utils import (
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -211,6 +212,8 @@ class Qwen2MoeMLP(nn.Module):
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
         self._down_input_scale_inv_1d = None
+        # Opt-in (SGLANG_DENSE_SWIGLU_FP8_FUSION_EXT): no forward mode reaches here.
+        self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
 
     def _silu_fp4_quant_fused(self, gate_up: torch.Tensor) -> tuple:
         from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize
@@ -246,7 +249,10 @@ class Qwen2MoeMLP(nn.Module):
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
             return x
-        x = self.act_fn(gate_up)
+        if self.activation_quant.applies(None) and not isinstance(gate_up, tuple):
+            x = self.activation_quant.forward(gate_up, self.act_fn, self.down_proj)
+        else:
+            x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
 

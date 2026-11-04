@@ -68,7 +68,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                     with self.subTest(model=model, m=m):
                         x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16)
                         gate_up, _ = mlp.gate_up_proj(x)
-                        quantized = mlp.activation_quant.forward_decode(
+                        quantized = mlp.activation_quant.forward(
                             gate_up, mlp.act_fn, mlp.down_proj
                         )
                         self.assertIsInstance(quantized, tuple)
@@ -92,7 +92,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
             expected = mlp(x)
             with mock.patch.object(
                 type(mlp.activation_quant),
-                "forward_decode",
+                "forward",
                 side_effect=AssertionError("non-decode entered fusion dispatch"),
             ):
                 for mode in (None, *ForwardMode):
@@ -153,7 +153,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
         x = torch.randn(3, 1536, device="cuda", dtype=torch.bfloat16)
 
         def check(*, value=x, projection=mlp.down_proj):
-            actual = mlp.activation_quant.forward_decode(value, mlp.act_fn, projection)
+            actual = mlp.activation_quant.forward(value, mlp.act_fn, projection)
             self.assertIsInstance(actual, torch.Tensor)
             torch.testing.assert_close(actual, mlp.act_fn(value), rtol=0, atol=0)
 
@@ -183,7 +183,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
             weight=mlp.down_proj.weight,
         )
         check(projection=wrapped_projection)
-        actual = mlp.activation_quant.forward_decode(
+        actual = mlp.activation_quant.forward(
             x, torch.nn.Identity(), mlp.down_proj
         )
         self.assertIs(actual, x)
@@ -192,7 +192,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
         try:
             check()
             compiled = torch.compile(
-                lambda value: mlp.activation_quant.forward_decode(
+                lambda value: mlp.activation_quant.forward(
                     value, mlp.act_fn, mlp.down_proj
                 ),
                 backend="eager",
@@ -243,7 +243,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                 ).cuda()
                 helper = DenseSiluAndMulQuant(layer)
                 torch.testing.assert_close(
-                    helper.forward_decode(x, act, layer), expected, rtol=0, atol=0
+                    helper.forward(x, act, layer), expected, rtol=0, atol=0
                 )
         mlp = self._make_mlp("llama")
         for scope in (
@@ -253,7 +253,7 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
             with scope:
                 helper = DenseSiluAndMulQuant(mlp.down_proj)
             torch.testing.assert_close(
-                helper.forward_decode(x, act, mlp.down_proj), expected, rtol=0, atol=0
+                helper.forward(x, act, mlp.down_proj), expected, rtol=0, atol=0
             )
 
     @torch.inference_mode()
@@ -276,14 +276,14 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                 fp8_utils, "_deepgemm_block_fp8_supported", side_effect=AssertionError
             ),
         ):
-            self.assertIsInstance(helper.forward_decode(x, mlp.act_fn, layer), tuple)
+            self.assertIsInstance(helper.forward(x, mlp.act_fn, layer), tuple)
         for attr, value in (
             ("weight", torch.nn.Parameter(layer.weight.reshape(1024, 384), False)),
             ("quant_method", object()),
         ):
             with self.subTest(attr=attr), mock.patch.object(layer, attr, value):
                 torch.testing.assert_close(
-                    helper.forward_decode(x, mlp.act_fn, layer),
+                    helper.forward(x, mlp.act_fn, layer),
                     expected,
                     rtol=0,
                     atol=0,
@@ -301,11 +301,75 @@ class TestDenseSiluAndMulQuant(CustomTestCase):
                     DenseSiluAndMulQuant(other).enabled, (n, k) == (512, 768)
                 )
                 torch.testing.assert_close(
-                    helper.forward_decode(x, mlp.act_fn, other),
+                    helper.forward(x, mlp.act_fn, other),
                     expected,
                     rtol=0,
                     atol=0,
                 )
+
+
+@unittest.skipUnless(get_device_sm() == 90, "SM90 DeepGEMM fp32-scale extension")
+@mock.patch.object(fp8_utils, "FP8_GEMM_RUNNER_BACKEND", Fp8GemmRunnerBackend.DEEP_GEMM)
+class TestDenseSiluAndMulQuantSm90Ext(CustomTestCase):
+    """SGLANG_DENSE_SWIGLU_FP8_FUSION_EXT: SM90 fp32 scales, every forward mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        init_single_process_dist()
+
+    def _make_mlp(self, model, ext):
+        from sglang.srt.environ import envs
+        from sglang.srt.models.llama import LlamaMLP
+        from sglang.srt.models.qwen2_moe import Qwen2MoeMLP
+
+        config = Fp8Config(
+            is_checkpoint_fp8_serialized=True,
+            activation_scheme="dynamic",
+            weight_block_size=[128, 128],
+        )
+        with (
+            envs.SGLANG_DENSE_SWIGLU_FP8_FUSION_EXT.override(ext),
+            set_default_torch_dtype(torch.bfloat16),
+        ):
+            mlp = {"llama": LlamaMLP, "qwen2_moe": Qwen2MoeMLP}[model](
+                512, 768, "silu", quant_config=config, reduce_results=False
+            ).cuda()
+        with torch.no_grad():
+            for layer in (mlp.gate_up_proj, mlp.down_proj):
+                weight = torch.randn(layer.weight.shape, device="cuda") * 0.02
+                layer.weight.copy_(weight.to(torch.float8_e4m3fn))
+                layer.weight_scale_inv.uniform_(0.5, 2)
+                layer.quant_method.process_weights_after_loading(layer)
+        return mlp
+
+    @torch.inference_mode()
+    def test_opt_in_only(self):
+        """Without the flag SM90 keeps the separate activation."""
+        for model in ("llama", "qwen2_moe"):
+            self.assertFalse(self._make_mlp(model, ext=False).activation_quant.enabled)
+
+    @torch.inference_mode()
+    def test_every_mode_matches_unfused(self):
+        """Fused (q, fp32 scale) tuples must reproduce the unfused MLP bit for bit."""
+        torch.manual_seed(0)
+        modes = (None, ForwardMode.EXTEND, ForwardMode.DECODE, ForwardMode.TARGET_VERIFY)
+        for model in ("llama", "qwen2_moe"):
+            mlp = self._make_mlp(model, ext=True)
+            helper = mlp.activation_quant
+            self.assertTrue(helper.enabled)
+            for m in (1, 5, 64, 1000):
+                x = torch.randn(m, 512, device="cuda", dtype=torch.bfloat16) * 4
+                gate_up, _ = mlp.gate_up_proj(x)
+                quantized = helper.forward(gate_up, mlp.act_fn, mlp.down_proj)
+                self.assertIsInstance(quantized, tuple)
+                self.assertEqual(quantized[1].dtype, torch.float32)
+                expected, _ = mlp.down_proj(mlp.act_fn(gate_up))
+                for mode in modes if model == "llama" else (None,):
+                    with self.subTest(model=model, m=m, mode=mode):
+                        batch = None if mode is None else SimpleNamespace(forward_mode=mode)
+                        self.assertTrue(helper.applies(batch))
+                        actual = mlp(x) if batch is None else mlp(x, batch)
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

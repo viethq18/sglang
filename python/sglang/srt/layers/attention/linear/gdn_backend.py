@@ -67,7 +67,6 @@ if is_cuda() or is_hip() or is_xpu():
         fused_qkvzba_split_reshape_cat_contiguous,
     )
 
-MAX_FUSED_QKV_SPLIT_DIM = 8192
 _fused_decode_proj_conv_logged = False
 _fused_decode_proj_conv_fallback_logged = False
 _fused_decode_proj_conv_layers_logged: set[int] = set()
@@ -1111,24 +1110,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
         layer: RadixLinearAttention, mixed_qkv: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """forward_extend's q / k / v split for a plain extend on CUDA."""
-        if layer.q_dim + layer.k_dim + layer.v_dim <= MAX_FUSED_QKV_SPLIT_DIM:
-            return fused_qkv_split_gdn_prefill(
-                mixed_qkv,
-                layer.num_q_heads,
-                layer.num_k_heads,
-                layer.num_v_heads,
-                layer.head_q_dim,
-                layer.head_k_dim,
-                layer.head_v_dim,
-            )
-        seq_len = mixed_qkv.shape[0]
-        query, key, value = torch.split(
-            mixed_qkv, [layer.q_dim, layer.k_dim, layer.v_dim], dim=-1
-        )
-        return (
-            query.view(1, seq_len, layer.num_q_heads, layer.head_q_dim),
-            key.view(1, seq_len, layer.num_k_heads, layer.head_k_dim),
-            value.view(1, seq_len, layer.num_v_heads, layer.head_v_dim),
+        return fused_qkv_split_gdn_prefill(
+            mixed_qkv,
+            layer.num_q_heads,
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_q_dim,
+            layer.head_k_dim,
+            layer.head_v_dim,
         )
 
     def _forward_extend_in_graph(
@@ -1328,12 +1317,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
 
         actual_seq_len = mixed_qkv.shape[0]
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (
-            (is_cuda() or is_hip() or is_xpu())
-            and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM
-            and not self._use_strided_target_verify_qkv
-        ):
+        if (is_cuda() or is_hip() or is_xpu()) and not self._use_strided_target_verify_qkv:
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
@@ -1577,8 +1561,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             seq_lens_cpu=seq_lens_cpu,
         ).transpose(0, 1)
 
-        qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
-        if (is_cuda() or is_hip()) and qkv_dim <= MAX_FUSED_QKV_SPLIT_DIM:
+        if is_cuda() or is_hip():
             query, key, value = fused_qkv_split_gdn_prefill(
                 mixed_qkv,
                 layer.num_q_heads,
