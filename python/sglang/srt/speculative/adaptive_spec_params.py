@@ -55,10 +55,10 @@ def adaptive_unsupported_reason(server_args: ServerArgs) -> str | None:
 
     cfg = resolving_view(server_args)
 
-    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+    if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "FROZEN_KV_MTP"):
         return (
             f"speculative_algorithm={cfg.speculative_algorithm} "
-            "(only EAGLE/EAGLE3 are supported)"
+            "(only EAGLE/EAGLE3/FROZEN_KV_MTP are supported)"
         )
     platform_worker_cls = SpeculativeAlgorithm.from_string(
         cfg.speculative_algorithm
@@ -140,6 +140,21 @@ def resolve_candidate_steps_from_config(
     for entry in bs_entries.values():
         all_steps.update(entry["candidate_steps"])
     return sorted(all_steps)
+
+
+ADAPTIVE_POLICIES = ("acceptance", "goodput")
+
+
+def adaptive_policy_name(cfg_path: str | None = None) -> str:
+    """Top-level ``"policy"`` of the adaptive config (default ``"acceptance"``)."""
+    cfg, _ = _load_adaptive_config(cfg_path)
+    name = cfg.get("policy", "acceptance")
+    if name not in ADAPTIVE_POLICIES:
+        raise ValueError(
+            f"speculative_adaptive_config policy={name!r} is not one of "
+            f"{list(ADAPTIVE_POLICIES)}"
+        )
+    return name
 
 
 class AdaptiveStepSlot:
@@ -269,6 +284,10 @@ class AdaptiveSpeculativeParams:
 
     A slot is a per-BS configuration of adaptive step selection.
     """
+
+    # Whether the worker must feed ``observe_step_time`` with measured
+    # decode-step GPU time.
+    needs_step_timing = False
 
     def __init__(
         self,

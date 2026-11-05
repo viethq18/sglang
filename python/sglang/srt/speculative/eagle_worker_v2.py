@@ -1330,6 +1330,9 @@ class EAGLEWorkerV2(BaseSpecWorker):
     # harnesses construct workers without __init__.
     _post_verify_graphs: Optional[EaglePostVerifyGraphs] = None
     _simulated_acc_len_rng: Optional[torch.Generator] = None
+    # Verify-input type of the steps=0 trivial verify; subclasses with their own
+    # spec-input tag override it.
+    verify_input_cls = EagleVerifyInput
 
     @property
     def draft_parallel_layout(self):
@@ -1757,7 +1760,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         one new bonus token from target logits -- functionally a plain decode.
         """
         if batch.forward_mode.is_idle():
-            return EagleVerifyInput.create_idle_input(
+            return self.verify_input_cls.create_idle_input(
                 topk=self.topk, spec_steps=0, num_verify_tokens=1, device=self.device
             )
 
@@ -1787,7 +1790,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
 
         positions = batch.seq_lens.to(torch.int64)
 
-        return EagleVerifyInput(
+        return self.verify_input_cls(
             draft_token=draft_input.bonus_tokens,
             custom_mask=custom_mask,
             positions=positions,
@@ -1834,7 +1837,10 @@ class EAGLEWorkerV2(BaseSpecWorker):
             )
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        num_draft_tokens: int | None = None,
     ) -> None:
         if self.adaptive_controller is not None:
             self.adaptive_controller.on_verify_complete(
@@ -1865,48 +1871,11 @@ class EAGLEWorkerV2(BaseSpecWorker):
             self._draft_worker.init_attention_backend()
             self._draft_worker._capture_cuda_graphs()
 
-            # Build target attention backend and CUDA graph runner
-            target_model_runner = self._target_worker.model_runner
-            backup_init = target_model_runner.init_new_workspace
-            try:
-                target_attn_backend = target_model_runner._get_attention_backend(
-                    init_new_workspace=True
+            target_attn_backend, target_graph_runner = (
+                self._build_adaptive_target_side(
+                    speculative_num_steps, speculative_num_draft_tokens
                 )
-            finally:
-                target_model_runner.init_new_workspace = backup_init
-
-            target_graph_runner = None
-            TargetGraphRunnerCls = None
-            if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
-                # Same runner class as the startup target verify graph on OOT.
-                TargetGraphRunnerCls = _select_spec_graph_runner_cls(
-                    builtin_runner_cls=lambda: DecodeCudaGraphRunner,
-                    oot_runner_cls=current_platform.get_graph_runner_cls,
-                )
-            if TargetGraphRunnerCls is not None:
-                target_graph_before_mem = get_available_gpu_memory(
-                    self.device, self.gpu_id
-                )
-                target_graph_tic = time.perf_counter()
-                target_graph_runner = TargetGraphRunnerCls(
-                    target_model_runner,
-                    attn_backend=target_attn_backend,
-                    speculative_num_steps=speculative_num_steps,
-                    speculative_num_draft_tokens=speculative_num_draft_tokens,
-                )
-                target_graph_after_mem = get_available_gpu_memory(
-                    self.device, self.gpu_id
-                )
-                target_graph_time = time.perf_counter() - target_graph_tic
-                self._additional_graph_memory_usage["target_verify"] = (
-                    self._additional_graph_memory_usage.get("target_verify", 0.0)
-                    + target_graph_before_mem
-                    - target_graph_after_mem
-                )
-                self._additional_graph_time_usage["target_verify"] = (
-                    self._additional_graph_time_usage.get("target_verify", 0.0)
-                    + target_graph_time
-                )
+            )
 
             state = SpecRuntimeState(
                 speculative_num_steps=speculative_num_steps,
@@ -1928,6 +1897,50 @@ class EAGLEWorkerV2(BaseSpecWorker):
         )
 
         return state
+
+    def _build_adaptive_target_side(
+        self, speculative_num_steps: int, speculative_num_draft_tokens: int
+    ):
+        """Build the target attention backend and verify CUDA graph runner for
+        one adaptive step configuration. Caller holds ``_override_worker_state``."""
+        target_model_runner = self._target_worker.model_runner
+        backup_init = target_model_runner.init_new_workspace
+        try:
+            target_attn_backend = target_model_runner._get_attention_backend(
+                init_new_workspace=True
+            )
+        finally:
+            target_model_runner.init_new_workspace = backup_init
+
+        target_graph_runner = None
+        TargetGraphRunnerCls = None
+        if not check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
+            # Same runner class as the startup target verify graph on OOT.
+            TargetGraphRunnerCls = _select_spec_graph_runner_cls(
+                builtin_runner_cls=lambda: DecodeCudaGraphRunner,
+                oot_runner_cls=current_platform.get_graph_runner_cls,
+            )
+        if TargetGraphRunnerCls is not None:
+            target_graph_before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            target_graph_tic = time.perf_counter()
+            target_graph_runner = TargetGraphRunnerCls(
+                target_model_runner,
+                attn_backend=target_attn_backend,
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+            )
+            target_graph_after_mem = get_available_gpu_memory(self.device, self.gpu_id)
+            target_graph_time = time.perf_counter() - target_graph_tic
+            self._additional_graph_memory_usage["target_verify"] = (
+                self._additional_graph_memory_usage.get("target_verify", 0.0)
+                + target_graph_before_mem
+                - target_graph_after_mem
+            )
+            self._additional_graph_time_usage["target_verify"] = (
+                self._additional_graph_time_usage.get("target_verify", 0.0)
+                + target_graph_time
+            )
+        return target_attn_backend, target_graph_runner
 
     def apply_runtime_state(self, state: SpecRuntimeState) -> None:
         """Apply a pre-built runtime state to this worker."""
