@@ -12,7 +12,7 @@ It is designed for workloads whose accept length changes over time, where one st
 - `--speculative-algorithm EAGLE`, `EAGLE3`, or a Frozen-KV MTP draft (`FROZEN_KV_MTP`, e.g. the Gemma 4 assistant model)
 - Only `--speculative-eagle-topk 1`
 - If either condition is not met, SGLang falls back to static speculative settings
-- `"policy": "goodput"` additionally requires `FROZEN_KV_MTP` with `tp_size == pp_size == 1`
+- `"policy": "goodput"` additionally requires `FROZEN_KV_MTP` with `pp_size == 1`; under tensor parallelism every rank learns from rank 0's step times so all ranks pick the same `k`
 
 ## Why adaptive steps help
 

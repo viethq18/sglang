@@ -44,6 +44,7 @@ from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
+    get_parallel,
     get_schedule,
     get_spec,
 )
@@ -98,6 +99,29 @@ logger = logging.getLogger(__name__)
 
 # Cap on decode-step timing spans awaiting their verify result.
 _MAX_PENDING_STEP_SPANS = 64
+# Multi-rank timing: spans per rank-0 broadcast, and the newest spans left in
+# flight so the rank-0 event wait does not stall on the running step.
+_SYNC_STEP_SPANS = 16
+_SYNC_STEP_SPANS_LAG = 4
+
+
+def _observe_synced_step_times(
+    pending: deque, free_events: list, policy, group
+) -> None:
+    """Feed every rank rank 0's step times so all TP ranks choose the same k."""
+    if len(pending) < _SYNC_STEP_SPANS + _SYNC_STEP_SPANS_LAG:
+        return
+    spans = [pending.popleft() for _ in range(_SYNC_STEP_SPANS)]
+    times_ms = None
+    if group.rank_in_group == 0:
+        times_ms = []
+        for _, _, start, end in spans:
+            end.synchronize()
+            times_ms.append(start.elapsed_time(end))
+    times_ms = group.broadcast_object(times_ms, src=0)
+    for (steps, bs, start, end), ms in zip(spans, times_ms, strict=True):
+        policy.observe_step_time(steps, bs, ms)
+        free_events += (start, end)
 
 
 class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
@@ -843,6 +867,12 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
         )
         self._pending_step_spans: deque = deque()
         self._free_step_events: list = []
+        # Ranks sharing a batch must agree on k; their local timings differ.
+        self._timing_group = (
+            get_parallel().attn_tp_group
+            if get_parallel().attn_dp_enabled
+            else get_parallel().tp_group
+        )
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
         self.num_new_pages_per_topk = torch.empty(
@@ -978,10 +1008,18 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             )
             return
         policy = self.adaptive_controller.params
-        while self._pending_step_spans and self._pending_step_spans[0][3].query():
-            steps, bs, start, end = self._pending_step_spans.popleft()
-            policy.observe_step_time(steps, bs, start.elapsed_time(end))
-            self._free_step_events += (start, end)
+        if self._timing_group.world_size > 1:
+            _observe_synced_step_times(
+                self._pending_step_spans,
+                self._free_step_events,
+                policy,
+                self._timing_group,
+            )
+        else:
+            while self._pending_step_spans and self._pending_step_spans[0][3].query():
+                steps, bs, start, end = self._pending_step_spans.popleft()
+                policy.observe_step_time(steps, bs, start.elapsed_time(end))
+                self._free_step_events += (start, end)
         if num_draft_tokens is not None:
             # The batch's own draft length: the active k may have moved since.
             policy.observe_accepts(num_correct_drafts_per_req, num_draft_tokens - 1)

@@ -1431,17 +1431,16 @@ def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     )
 
     if adaptive_policy_name(cfg.speculative_adaptive_config) == "goodput":
-        # Goodput decisions use rank-local GPU timings; ranks must not diverge.
         if cfg.speculative_algorithm != "FROZEN_KV_MTP":
             raise ValueError(
                 'speculative_adaptive_config policy="goodput" is only supported '
                 f"for FROZEN_KV_MTP, got {cfg.speculative_algorithm}"
             )
-        if (cfg.tp_size, cfg.pp_size) != (1, 1):
+        # Step times are synced over the TP group only; PP stages time different work.
+        if cfg.pp_size != 1:
             raise ValueError(
                 'speculative_adaptive_config policy="goodput" requires '
-                f"tp_size=1 and pp_size=1, got tp_size={cfg.tp_size}, "
-                f"pp_size={cfg.pp_size}"
+                f"pp_size=1, got pp_size={cfg.pp_size}"
             )
 
     if cfg.speculative_eagle_topk is None:

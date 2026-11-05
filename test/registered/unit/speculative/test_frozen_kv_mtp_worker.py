@@ -1,6 +1,9 @@
 """Full-chain MTP preserves generic tree topology without probability ranking."""
 
+import json
+import tempfile
 import unittest
+from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +11,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.speculative import frozen_kv_mtp_worker_v2 as module
+from sglang.srt.speculative.adaptive_goodput_policy import GoodputAdaptivePolicy
 from sglang.srt.speculative.eagle_utils import organize_draft_results
 from sglang.srt.speculative.frozen_kv_mtp_info import FrozenKVMTPDraftInput
 from sglang.srt.speculative.spec_utils import select_top_k_tokens
@@ -99,6 +103,85 @@ class TestFrozenKVMTPChain(CustomTestCase):
         for topk, width in ((1, 3), (2, 5)):
             with self.subTest(topk=topk, width=width):
                 self.check_tree(3, topk, width)
+
+
+class _Event:
+    def __init__(self, ms=None):
+        self.ms = ms
+
+    def synchronize(self):
+        pass
+
+    def elapsed_time(self, end):
+        if end.ms is None:
+            raise AssertionError("a non-leader rank read its own GPU timing")
+        return end.ms
+
+
+class _Rank0BroadcastGroup:
+    """Collective stand-in: rank 0 publishes, the other rank receives it."""
+
+    def __init__(self, rank, wire):
+        self.rank_in_group = rank
+        self.wire = wire
+
+    def broadcast_object(self, obj, src=0):
+        if self.rank_in_group == src:
+            self.wire.append(obj)
+            return obj
+        return self.wire.pop(0)
+
+
+class TestTensorParallelStepTiming(CustomTestCase):
+    def _policy(self):
+        cfg = {
+            "policy": "goodput",
+            "1": {"candidate_steps": [1, 3]},
+            "min_samples": 1,
+            "warmup_samples": 0,
+            "alpha_halflife": 1e12,
+            "explore_interval": 10**9,
+        }
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(cfg, f)
+            f.flush()
+            return GoodputAdaptivePolicy(initial_steps=3, cfg_path=f.name)
+
+    def _spans(self, n, cost_ms):
+        # Alternating k=1 / k=3 decode steps at batch size 1.
+        spans = deque()
+        for i in range(n):
+            k = 1 if i % 2 else 3
+            ms = None if cost_ms is None else cost_ms[k]
+            spans.append([k, 1, _Event(), _Event(ms)])
+        return spans
+
+    def test_ranks_with_diverging_local_timings_choose_rank0_steps(self):
+        # alpha prior 0.5: E[1] = 1.5, E[3] = 1.875. Rank 0 times favour k=3;
+        # rank 1 would favour k=1 (25 ms for k=3) if it trusted its own clock.
+        wire = []
+        picks = []
+        for rank, cost_ms in ((0, {1: 10.0, 3: 10.0}), (1, None)):
+            policy = self._policy()
+            pending, free = self._spans(20, cost_ms), []
+            module._observe_synced_step_times(
+                pending, free, policy, _Rank0BroadcastGroup(rank, wire)
+            )
+            self.assertEqual(len(pending), 4)
+            self.assertEqual(len(free), 32)
+            picks.append(policy.get_steps_for_batch(1))
+        self.assertEqual(picks, [3, 3])
+        self.assertEqual(wire, [])
+
+    def test_no_collective_until_a_full_batch_plus_lag_is_pending(self):
+        wire = []
+        policy = self._policy()
+        pending, free = self._spans(19, {1: 10.0, 3: 10.0}), []
+        module._observe_synced_step_times(
+            pending, free, policy, _Rank0BroadcastGroup(0, wire)
+        )
+        self.assertEqual((len(pending), free, wire), (19, [], []))
+        self.assertIsNone(policy.goodput(3, 1))
 
 
 if __name__ == "__main__":

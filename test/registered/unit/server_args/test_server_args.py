@@ -3222,19 +3222,27 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         )
         return args
 
-    def test_goodput_policy_rejected_outside_frozen_kv_mtp_single_rank(self):
+    def test_goodput_policy_rejected_outside_frozen_kv_mtp_without_pp(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
             json.dump({"policy": "goodput", "1": {"candidate_steps": [1, 3]}}, f)
             f.flush()
             for algorithm, overrides in (
                 ("EAGLE", {}),
-                ("FROZEN_KV_MTP", {"tp_size": 2}),
+                ("FROZEN_KV_MTP", {"pp_size": 2}),
             ):
                 with self.subTest(algorithm=algorithm, **overrides):
                     with self.assertRaisesRegex(ValueError, "goodput"):
                         handle_speculative_decoding(
                             self._goodput_args(f.name, algorithm, **overrides)
                         )
+
+    def test_goodput_policy_accepts_frozen_kv_mtp_tensor_parallel(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"policy": "goodput", "1": {"candidate_steps": [1, 3]}}, f)
+            f.flush()
+            args = self._goodput_args(f.name, "FROZEN_KV_MTP", tp_size=4)
+            handle_speculative_decoding(args)
+            self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
 
     def test_unknown_adaptive_policy_rejected(self):
         with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
