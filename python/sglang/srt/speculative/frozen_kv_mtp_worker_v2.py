@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import time
+from collections import deque
 from typing import Optional
 
 import torch
@@ -47,6 +48,15 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.adaptive_goodput_policy import GoodputAdaptivePolicy
+from sglang.srt.speculative.adaptive_runtime_state import (
+    AdaptiveController,
+    SpecRuntimeState,
+)
+from sglang.srt.speculative.adaptive_spec_params import (
+    AdaptiveSpeculativeParams,
+    adaptive_policy_name,
+)
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker, EagleDraftWorkerBase
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.eagle_utils import (
@@ -76,7 +86,7 @@ from sglang.srt.speculative.spec_utils import (
     select_top_k_tokens,
     spec_stage_span,
 )
-from sglang.srt.utils import get_available_gpu_memory
+from sglang.srt.utils import get_available_gpu_memory, log_info_on_rank0
 from sglang.srt.utils.async_probe import (
     maybe_detect_inf,
     maybe_detect_nan,
@@ -85,6 +95,9 @@ from sglang.srt.utils.async_probe import (
 from sglang.srt.utils.common import fast_topk
 
 logger = logging.getLogger(__name__)
+
+# Cap on decode-step timing spans awaiting their verify result.
+_MAX_PENDING_STEP_SPANS = 64
 
 
 class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
@@ -217,14 +230,15 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             self.draft_model_runner.draft_attn_backend = self.draft_attn_backend
         self._check_draft_swa_pool_is_target()
 
-    def _check_draft_swa_pool_is_target(self) -> None:
+    def _check_draft_swa_pool_is_target(self, backend=None) -> None:
         # FA translates on its own SWA pool; the view swap reads the target pool.
         # They must be the same object, or ids silently index the wrong buffer.
         from sglang.srt.layers.attention.flashattention_backend import (
             FlashAttentionBackend,
         )
 
-        backend = self.draft_attn_backend
+        if backend is None:
+            backend = self.draft_attn_backend
         if not isinstance(backend, FlashAttentionBackend):
             return
         if backend._window_kv_pool is None or self.kv_context is None:
@@ -302,6 +316,23 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 
         return TRTLLMHAAttnBackend(self.draft_model_runner, skip_prefill=True)
+
+    def _new_adaptive_draft_attn_backend(self):
+        """A topk=1 draft backend of its own for one adaptive step config.
+
+        The draft CUDA graph runner initializes the backend's graph state at
+        capture; sharing one backend across step configs would overwrite the
+        buffers earlier graphs replay from.
+        """
+        runner = self.draft_model_runner
+        backup_init = runner.init_new_workspace
+        try:
+            backend = runner._get_attention_backend(init_new_workspace=True)
+        finally:
+            runner.init_new_workspace = backup_init
+        runner.runner_ids.bind_and_verify_backends([backend])
+        self._check_draft_swa_pool_is_target(backend)
+        return backend
 
     def _bind_kv_context(self) -> None:
         draft_model = self.draft_model_runner.model
@@ -756,6 +787,8 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
     are frozen-specific.
     """
 
+    verify_input_cls = FrozenKVMTPVerifyInput
+
     def __init__(
         self,
         server_args: ServerArgs,
@@ -790,11 +823,26 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             target_worker,
         )
 
-        # Frozen MTP does not wire the adaptive controller yet.
-        assert not get_spec().speculative_adaptive, (
-            "Frozen-KV MTP does not support adaptive speculative decoding yet."
+        self.adaptive_controller: Optional[AdaptiveController] = None
+        if get_spec().speculative_adaptive:
+            cfg_path = get_spec().speculative_adaptive_config
+            policy_cls = (
+                GoodputAdaptivePolicy
+                if adaptive_policy_name(cfg_path) == "goodput"
+                else AdaptiveSpeculativeParams
+            )
+            self.adaptive_controller = AdaptiveController(
+                self,
+                policy_cls(initial_steps=self.speculative_num_steps, cfg_path=cfg_path),
+            )
+        # In-flight (steps, batch_size, start, end) CUDA-event spans of decode
+        # steps for a policy that learns from step time, plus a free list.
+        self._step_timing = (
+            self.adaptive_controller is not None
+            and self.adaptive_controller.params.needs_step_timing
         )
-        self.adaptive_controller = None
+        self._pending_step_spans: deque = deque()
+        self._free_step_events: list = []
 
         # Some dummy tensors (parity with EAGLEWorkerV2 init).
         self.num_new_pages_per_topk = torch.empty(
@@ -854,16 +902,23 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
                 return batch_output
         else:
             self.activate_step_by_batch(batch.seq_lens.shape[0])
+            span = self._start_step_span(batch)
 
             if batch.spec_info is None:
                 batch.spec_info = self.draft_worker._idle_seed()
-            with (
-                draft_tp_context(self.draft_worker.parallel_layout),
-                speculative_moe_backend_context(),
-                speculative_moe_a2a_backend_context(),
-                spec_stage_span("draft"),
-            ):
-                verify_input = self.draft_worker.draft(batch)
+            if self.speculative_num_steps == 0:
+                # Adaptive k=0: verify the seed bonus token alone (a plain
+                # decode). Draft-extend below still stashes a fresh seed, so a
+                # later k>0 drafts from the current position.
+                verify_input = self._build_trivial_verify_input(batch)
+            else:
+                with (
+                    draft_tp_context(self.draft_worker.parallel_layout),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                    spec_stage_span("draft"),
+                ):
+                    verify_input = self.draft_worker.draft(batch)
             assert verify_input.is_verify_input()
             batch.spec_info = verify_input
             batch_output = self.verify(
@@ -884,5 +939,119 @@ class FrozenKVMTPWorkerV2(EAGLEWorkerV2):
             if self._post_verify_graphs is not None:
                 # The mamba state commit may still run on a side stream.
                 self._post_verify_graphs.join()
+            if span is not None:
+                span[3].record()
+                self._pending_step_spans.append(span)
 
             return batch_output
+
+    # -- Adaptive speculative decoding --
+
+    def _start_step_span(self, batch: ScheduleBatch):
+        """Open a GPU-time span of this decode step for a timing-driven policy:
+        ``[steps, batch_size, start_event, end_event]``; None when untimed."""
+        if not self._step_timing or batch.forward_mode.is_idle():
+            return None
+        if len(self._pending_step_spans) >= _MAX_PENDING_STEP_SPANS:
+            # Results are not being consumed; drop the oldest unmeasured span.
+            self._free_step_events.extend(self._pending_step_spans.popleft()[2:])
+        if len(self._free_step_events) >= 2:
+            start = self._free_step_events.pop()
+            end = self._free_step_events.pop()
+        else:
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        return [self.speculative_num_steps, batch.seq_lens.shape[0], start, end]
+
+    def on_verify_complete_cpu(
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        num_draft_tokens: int | None = None,
+    ) -> None:
+        if self.adaptive_controller is None:
+            return
+        if not self._step_timing:
+            self.adaptive_controller.on_verify_complete(
+                num_correct_drafts_per_req, batch_size=batch_size
+            )
+            return
+        policy = self.adaptive_controller.params
+        while self._pending_step_spans and self._pending_step_spans[0][3].query():
+            steps, bs, start, end = self._pending_step_spans.popleft()
+            policy.observe_step_time(steps, bs, start.elapsed_time(end))
+            self._free_step_events += (start, end)
+        if num_draft_tokens is not None:
+            # The batch's own draft length: the active k may have moved since.
+            policy.observe_accepts(num_correct_drafts_per_req, num_draft_tokens - 1)
+
+    def build_adaptive_runtime_state(
+        self,
+        speculative_num_steps: int,
+        speculative_num_draft_tokens: int,
+        cuda_graph_bs=None,
+    ) -> SpecRuntimeState:
+        """Build a SpecRuntimeState for one step configuration.
+
+        Each k>0 gets a draft backend of its own (see
+        ``_new_adaptive_draft_attn_backend``); there is no draft-extend forward.
+        """
+        tic = time.perf_counter()
+        before_mem = get_available_gpu_memory(self.device, self.gpu_id)
+        dw = self._draft_worker
+
+        with self._override_worker_state(
+            speculative_num_steps,
+            speculative_num_draft_tokens,
+            cuda_graph_bs=cuda_graph_bs,
+        ):
+            if speculative_num_steps > 0:
+                with (
+                    draft_pp_context(),
+                    draft_tp_context(dw.parallel_layout),
+                    speculative_moe_backend_context(),
+                    speculative_moe_a2a_backend_context(),
+                ):
+                    draft_attn_backend = dw._new_adaptive_draft_attn_backend()
+                    dw.draft_attn_backend = draft_attn_backend
+                    dw.draft_model_runner.draft_attn_backend = draft_attn_backend
+                    dw.draft_model_runner.attn_backend = draft_attn_backend
+                    dw.cuda_graph_runner = None
+                    dw._capture_cuda_graphs()
+                draft_graph_runner = dw.cuda_graph_runner
+            else:
+                # k=0 never drafts; keep the active backend so probes stay typed.
+                draft_attn_backend = dw.draft_attn_backend
+                draft_graph_runner = None
+
+            target_attn_backend, target_graph_runner = (
+                self._build_adaptive_target_side(
+                    speculative_num_steps, speculative_num_draft_tokens
+                )
+            )
+            state = SpecRuntimeState(
+                speculative_num_steps=speculative_num_steps,
+                speculative_num_draft_tokens=speculative_num_draft_tokens,
+                draft_attn_backend=draft_attn_backend,
+                cuda_graph_runner=draft_graph_runner,
+                target_attn_backend=target_attn_backend,
+                target_graph_runner=target_graph_runner,
+                draft_extend_attn_backend=None,
+                cuda_graph_runner_for_draft_extend=None,
+            )
+
+        log_info_on_rank0(
+            logger,
+            f"Built adaptive runtime state steps={speculative_num_steps}: "
+            f"elapsed={time.perf_counter() - tic:.2f}s, "
+            f"mem={(before_mem - get_available_gpu_memory(self.device, self.gpu_id)):.2f}GB",
+        )
+        return state
+
+    def apply_runtime_state(self, state: SpecRuntimeState) -> None:
+        super().apply_runtime_state(state)
+        # topk=1 drafts read the runner's own backend (_init_draft_attn_backend);
+        # the base apply only swaps it for a draft-extend backend, which frozen
+        # does not have.
+        self._draft_worker.draft_model_runner.attn_backend = state.draft_attn_backend

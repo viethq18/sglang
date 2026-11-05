@@ -3206,6 +3206,43 @@ class TestAdaptiveSpecArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "speculative_num_steps"), 3)
         self.assertEqual(resolution_result(args, "speculative_num_draft_tokens"), 4)
 
+    def _goodput_args(self, cfg_path: str, algorithm: str, **overrides) -> ServerArgs:
+        args = ServerArgs(model_path="dummy")
+        args.speculative_algorithm = algorithm
+        args.speculative_adaptive = True
+        args.speculative_adaptive_config = cfg_path
+        args.device = "cuda"
+        for key, value in overrides.items():
+            setattr(args, key, value)
+        args._model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            )
+        )
+        return args
+
+    def test_goodput_policy_rejected_outside_frozen_kv_mtp_single_rank(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"policy": "goodput", "1": {"candidate_steps": [1, 3]}}, f)
+            f.flush()
+            for algorithm, overrides in (
+                ("EAGLE", {}),
+                ("FROZEN_KV_MTP", {"tp_size": 2}),
+            ):
+                with self.subTest(algorithm=algorithm, **overrides):
+                    with self.assertRaisesRegex(ValueError, "goodput"):
+                        handle_speculative_decoding(
+                            self._goodput_args(f.name, algorithm, **overrides)
+                        )
+
+    def test_unknown_adaptive_policy_rejected(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump({"policy": "fastest", "1": {"candidate_steps": [1, 3]}}, f)
+            f.flush()
+            with self.assertRaisesRegex(ValueError, "fastest"):
+                handle_speculative_decoding(self._goodput_args(f.name, "EAGLE"))
+
 
 class TestAscendOpsArgs(CustomTestCase):
     def test_ascend_ops_rejected_by_waterfill_without_config(self):

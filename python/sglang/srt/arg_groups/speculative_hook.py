@@ -1422,12 +1422,27 @@ def _maybe_disable_adaptive(server_args: ServerArgs) -> None:
 def _init_adaptive_speculative_params(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     from sglang.srt.speculative.adaptive_spec_params import (
+        adaptive_policy_name,
         resolve_candidate_steps_from_config,
     )
 
     candidate_steps = resolve_candidate_steps_from_config(
         cfg_path=cfg.speculative_adaptive_config,
     )
+
+    if adaptive_policy_name(cfg.speculative_adaptive_config) == "goodput":
+        # Goodput decisions use rank-local GPU timings; ranks must not diverge.
+        if cfg.speculative_algorithm != "FROZEN_KV_MTP":
+            raise ValueError(
+                'speculative_adaptive_config policy="goodput" is only supported '
+                f"for FROZEN_KV_MTP, got {cfg.speculative_algorithm}"
+            )
+        if (cfg.tp_size, cfg.pp_size) != (1, 1):
+            raise ValueError(
+                'speculative_adaptive_config policy="goodput" requires '
+                f"tp_size=1 and pp_size=1, got tp_size={cfg.tp_size}, "
+                f"pp_size={cfg.pp_size}"
+            )
 
     if cfg.speculative_eagle_topk is None:
         declare_resolution(

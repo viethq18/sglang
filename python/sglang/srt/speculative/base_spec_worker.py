@@ -397,10 +397,14 @@ class BaseSpecWorker(ABC):
             self.draft_worker.init_cuda_graphs()
 
     def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
+        self,
+        num_correct_drafts_per_req: list[int],
+        batch_size: int = 0,
+        num_draft_tokens: int | None = None,
     ) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
+        ``num_draft_tokens`` is the verify width the batch was drafted with.
         Default no-op. Adaptive-aware workers override this to feed the
         controller without forcing a GPU→CPU sync in the worker hot path.
         """

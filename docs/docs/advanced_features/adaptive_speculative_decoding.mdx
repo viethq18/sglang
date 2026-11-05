@@ -9,9 +9,10 @@ It is designed for workloads whose accept length changes over time, where one st
 
 ## Current support
 
-- Only `--speculative-algorithm EAGLE` or `EAGLE3`
+- `--speculative-algorithm EAGLE`, `EAGLE3`, or a Frozen-KV MTP draft (`FROZEN_KV_MTP`, e.g. the Gemma 4 assistant model)
 - Only `--speculative-eagle-topk 1`
 - If either condition is not met, SGLang falls back to static speculative settings
+- `"policy": "goodput"` additionally requires `FROZEN_KV_MTP` with `tp_size == pp_size == 1`
 
 ## Why adaptive steps help
 
@@ -106,6 +107,30 @@ target_steps ≈ clamp(round(ema_accept_len) + 1, min(candidate_steps), max(cand
 
 So if recent requests consistently accept more drafted tokens, the policy tends to move up. If they start rejecting earlier, it tends to move down.
 
+## Goodput policy (Frozen-KV MTP)
+
+Set `"policy": "goodput"` at the top level of the config file to replace the accept-length rule with a throughput model. For every decode step the policy picks the candidate `k` that maximizes
+
+```text
+goodput(k, bucket) = E[tokens per request | k] / T(k, bucket)
+```
+
+- `E[tokens | k] = 1 + sum_{j<=k} prod_{i<=j} alpha_i`, where `alpha_i` is the probability that draft position `i` is accepted given position `i-1` was. It is estimated from every verify result, with each request's observation censored at the `k` it actually ran, so one estimate serves all candidates. Untried positions inherit the previous position's estimate.
+- `T(k, bucket)` is the measured GPU time of one decode step (draft, verify, and draft-extend), recorded with CUDA events per CUDA-graph batch-size bucket and smoothed with an EMA. It is read without a host sync.
+
+Because cost is measured rather than assumed, the choice follows concurrency on its own: small batches are latency-bound and favor a deeper draft, while large batches are compute-bound, so the extra verify tokens cost real time and `k` shrinks, down to `0` (plain decode) if that is a candidate. Each bucket first measures every candidate once, then re-runs a non-current neighbor every `explore_interval` decisions to keep the estimates fresh. `k = 0` still runs the MTP draft-extend, so the next deeper step drafts from the current position.
+
+```json
+{
+  "policy": "goodput",
+  "1":  {"candidate_steps": [2, 3, 5]},
+  "16": {"candidate_steps": [1, 2, 3]},
+  "64": {"candidate_steps": [0, 1, 2]}
+}
+```
+
+Under the goodput policy only `candidate_steps` is read from each slot; the hysteresis and ceiling keys are ignored. Every candidate set is a CUDA-graph set, so keep the union small.
+
 ## Usage
 
 `--speculative-adaptive-config` is optional, but the speculative setup still needs to be valid for adaptive mode.
@@ -197,6 +222,11 @@ The config file is optional. When provided, each integer BS-slot key must specif
   </thead>
   <tbody>
     <tr>
+      <td><code>policy</code></td>
+      <td><code>"acceptance"</code></td>
+      <td><code>"acceptance"</code> (the EMA rule above) or <code>"goodput"</code> (Frozen-KV MTP only)</td>
+    </tr>
+    <tr>
       <td><code>ema_alpha</code></td>
       <td><code>0.2</code></td>
       <td>EMA smoothing factor for accepted draft length</td>
@@ -210,6 +240,72 @@ The config file is optional. When provided, each integer BS-slot key must specif
       <td><code>warmup_batches</code></td>
       <td><code>10</code></td>
       <td>Number of verify batches to observe before switching</td>
+    </tr>
+  </tbody>
+</table>
+
+### Goodput policy parameters
+
+Top-level keys that apply only when `"policy": "goodput"`.
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <colgroup>
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+    <col style={{width: "33.33%"}} />
+  </colgroup>
+  <thead>
+    <tr>
+      <th>Key</th>
+      <th>Default</th>
+      <th>Meaning</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>explore_interval</code></td>
+      <td><code>64</code></td>
+      <td>Decisions per bucket between runs of a non-current neighbor <code>k</code></td>
+    </tr>
+    <tr>
+      <td><code>switch_margin</code></td>
+      <td><code>0.02</code></td>
+      <td>Relative goodput gain required to leave the current <code>k</code></td>
+    </tr>
+    <tr>
+      <td><code>cost_ema</code></td>
+      <td><code>0.2</code></td>
+      <td>EMA weight of a new step-time sample</td>
+    </tr>
+    <tr>
+      <td><code>alpha_halflife</code></td>
+      <td><code>2000</code></td>
+      <td>Half-life, in request observations, of the acceptance counts</td>
+    </tr>
+    <tr>
+      <td><code>alpha_prior_weight</code></td>
+      <td><code>4</code></td>
+      <td>Pseudo-count pulling <code>alpha_i</code> toward <code>alpha_(i-1)</code></td>
+    </tr>
+    <tr>
+      <td><code>alpha_prior</code></td>
+      <td><code>0.5</code></td>
+      <td>Prior for <code>alpha_1</code> before any verify result</td>
+    </tr>
+    <tr>
+      <td><code>min_samples</code></td>
+      <td><code>2</code></td>
+      <td>Step-time samples needed per (<code>k</code>, bucket) before the estimate is used</td>
+    </tr>
+    <tr>
+      <td><code>warmup_samples</code></td>
+      <td><code>2</code></td>
+      <td>Leading step-time samples dropped per (<code>k</code>, bucket)</td>
+    </tr>
+    <tr>
+      <td><code>outlier_ratio</code> / <code>outlier_streak</code></td>
+      <td><code>4</code> / <code>3</code></td>
+      <td>A sample above <code>outlier_ratio</code> x EMA is dropped unless <code>outlier_streak</code> arrive in a row</td>
     </tr>
   </tbody>
 </table>

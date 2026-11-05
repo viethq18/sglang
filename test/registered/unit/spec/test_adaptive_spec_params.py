@@ -5,6 +5,7 @@ import unittest
 from sglang.srt.speculative.adaptive_spec_params import (
     AdaptiveSpeculativeParams,
     AdaptiveStepSlot,
+    adaptive_policy_name,
     resolve_candidate_steps_from_config,
 )
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
@@ -419,6 +420,26 @@ class TestResolveCandidateSteps(CustomTestCase):
             f.flush()
             steps = resolve_candidate_steps_from_config(cfg_path=f.name)
         self.assertEqual(steps, [1, 3, 5, 7])
+
+
+class TestAdaptivePolicyName(CustomTestCase):
+    def _name(self, cfg: dict) -> str:
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as f:
+            json.dump(cfg, f)
+            f.flush()
+            return adaptive_policy_name(f.name)
+
+    def test_defaults_to_acceptance(self):
+        self.assertEqual(adaptive_policy_name(), "acceptance")
+        self.assertEqual(self._name({"1": {"candidate_steps": [1]}}), "acceptance")
+
+    def test_goodput(self):
+        cfg = {"policy": "goodput", "1": {"candidate_steps": [1, 3]}}
+        self.assertEqual(self._name(cfg), "goodput")
+
+    def test_unknown_policy_raises(self):
+        with self.assertRaises(ValueError):
+            self._name({"policy": "fastest", "1": {"candidate_steps": [1]}})
 
 
 if __name__ == "__main__":
